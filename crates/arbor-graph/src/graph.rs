@@ -623,11 +623,7 @@ mod new_query_tests {
         g.add_edge(
             a,
             b,
-            Edge {
-                kind: EdgeKind::Calls,
-                file: None,
-                line: None,
-            },
+            Edge::new(EdgeKind::Calls),
         );
         let (nodes, edges) = g.nodes_in_file_with_edges("src/a.rs");
         assert_eq!(nodes.len(), 2);
@@ -646,11 +642,7 @@ mod new_query_tests {
         g.add_edge(
             a,
             c,
-            Edge {
-                kind: EdgeKind::Calls,
-                file: None,
-                line: None,
-            },
+            Edge::new(EdgeKind::Calls),
         );
         let (nodes, edges) = g.nodes_in_file_with_edges("src/a.rs");
         assert_eq!(nodes.len(), 1); // only foo
