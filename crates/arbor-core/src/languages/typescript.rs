@@ -97,20 +97,18 @@ fn extract_from_node(
                 }
             }
 
-            "export_statement" => {
-                for i in 0..node.child_count() {
-                    if let Some(child) = node.child(i) {
-                        let child_kind = child.kind();
-                        if matches!(
-                            child_kind,
-                            "function_declaration" | "class_declaration" | "lexical_declaration"
-                        ) {
-                            extract_from_node(&child, source, file_path, nodes, parent_name);
-                        }
-                    }
-                }
-            }
-
+            // `export_statement` is deliberately not handled here.
+            //
+            // It used to recurse into its declaration children explicitly, and
+            // then the generic child loop below recursed into those same
+            // children again — so every exported symbol was extracted twice.
+            // That doubled the node count for the export-heavy files typical of
+            // TS/JS, split each symbol's centrality across its duplicate, and
+            // double-counted it in blast radius. Two vertices also shared one
+            // `CodeNode::id`, since the id is a hash of (file, name, kind).
+            //
+            // The generic recursion already reaches every declaration, and
+            // `is_node_exported` reads the parent, so export status survives.
             _ => {}
         }
 
