@@ -60,4 +60,4 @@ pub use query::{DependentInfo, ImpactResult, NodeInfo, QueryResult};
 pub use ranking::{compute_centrality, compute_centrality_warm, CentralityScores};
 pub use slice::{ContextNode, ContextSlice, TruncationReason};
 pub use store::{GraphStore, StoreError};
-pub use symbol_table::SymbolTable;
+pub use symbol_table::{Resolution, SymbolEntry, SymbolTable};
