@@ -9,8 +9,12 @@ use crate::graph::{ArborGraph, NodeId};
 use crate::symbol_table::SymbolTable;
 use arbor_core::{CodeNode, NodeKind};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tracing::warn;
+
+/// Beyond this many candidate definitions, a bare name carries no information
+/// and linking to all of them would swamp the graph with noise.
+const MAX_AMBIGUOUS_FANOUT: usize = 4;
 
 /// Builds an ArborGraph from parsed code nodes.
 pub struct GraphBuilder {
@@ -114,16 +118,21 @@ impl GraphBuilder {
 
     /// Resolves references into actual graph edges.
     ///
-    /// Resolution order for each reference `R` from file `F`:
-    ///   1. Exact FQN match in symbol table
-    ///   2. Context-aware suffix match (prefers same directory, avoids ambiguity)
-    ///   3. Import-validated match — if R is in F's import map AND a match was found
-    ///      in step 2 for a different file, we skip it to avoid wrong-module edges
+    /// Each reference `R` from file `F` resolves through
+    /// [`SymbolTable::resolve_ref`], which reports *how* it matched. That
+    /// quality becomes the edge's confidence, so a downstream consumer can
+    /// distinguish a proven call from an educated guess instead of treating
+    /// every edge as fact.
     ///
-    /// References that cannot be resolved are silently dropped (they are external/stdlib
-    /// symbols with no definition in this repository).
+    /// Ambiguous references (several equally-plausible definitions) produce a
+    /// low-confidence edge to each candidate, capped at
+    /// [`MAX_AMBIGUOUS_FANOUT`]. Dropping them outright would silently hide
+    /// real call paths; emitting them unlabelled would overstate certainty.
+    ///
+    /// References with no definition in the repository are dropped — they are
+    /// external or stdlib symbols.
     pub fn resolve_edges(&mut self) {
-        let mut edges_to_add: Vec<(NodeId, NodeId, String)> = Vec::new();
+        let mut edges_to_add: Vec<(NodeId, NodeId, f32)> = Vec::new();
 
         let node_indices: Vec<NodeId> = self.graph.node_indexes().collect();
 
@@ -136,74 +145,118 @@ impl GraphBuilder {
             let from_file_str = from_file.to_string_lossy().to_string();
 
             for reference in references {
-                // 1. Exact FQN match
-                if let Some(to_idx) = self.symbol_table.resolve(&reference) {
-                    if from_idx != to_idx {
-                        edges_to_add.push((from_idx, to_idx, reference.clone()));
-                    }
+                let resolution = self.symbol_table.resolve_ref(&reference, &from_file);
+
+                if !resolution.is_resolved() {
+                    #[cfg(debug_assertions)]
+                    warn!(
+                        "Unresolved reference '{}' in {} (likely external/stdlib)",
+                        reference,
+                        from_file.display()
+                    );
                     continue;
                 }
 
-                // 2. Context-aware suffix match
-                if let Some(to_idx) = self
-                    .symbol_table
-                    .resolve_with_context(&reference, &from_file)
-                {
+                let base_confidence = resolution.confidence();
+                let candidates = resolution.candidates();
+
+                if candidates.len() > MAX_AMBIGUOUS_FANOUT {
+                    // A name like `new`, `get`, or `run` with dozens of
+                    // definitions carries no information. Linking to all of
+                    // them would swamp the graph.
+                    warn!(
+                        "Reference '{}' in {} has {} candidate definitions — too ambiguous to link",
+                        reference,
+                        from_file.display(),
+                        candidates.len()
+                    );
+                    continue;
+                }
+
+                for to_idx in candidates {
                     if from_idx == to_idx {
                         continue;
                     }
 
-                    // 3. Import-validation filter
-                    //
-                    // If this file has an explicit import map AND the reference is NOT
-                    // in it, the suffix match may have found a wrong-file coincidence.
-                    // Only apply this filter when the file has import data (not all parsers
-                    // provide it yet) and the reference is a simple name (no dots).
-                    //
-                    // Skip if: the file has imports, the name is NOT imported, and the
-                    // matched node is in a completely different part of the tree.
-                    // This prevents `validate()` in file X from linking to `validate` in
-                    // an unrelated module when `validate` is not imported.
-                    if let Some(file_imports) = self.import_map.get(&from_file_str) {
-                        if !file_imports.is_empty()
-                            && !reference.contains('.')
-                            && !file_imports.contains_key(&reference)
-                        {
-                            // Not imported explicitly — only allow if in same file or same dir
-                            let to_node = self.graph.get(to_idx).unwrap();
-                            let to_file = PathBuf::from(&to_node.file);
-                            let same_file = to_file == from_file;
-                            let same_dir = to_file.parent() == from_file.parent();
-                            if !same_file && !same_dir {
-                                warn!(
-                                    "Skipping unimported cross-module reference '{}' in {} → {}",
-                                    reference,
-                                    from_file.display(),
-                                    to_file.display()
-                                );
-                                continue;
-                            }
-                        }
+                    let confidence = self.apply_import_validation(
+                        &reference,
+                        &from_file,
+                        &from_file_str,
+                        to_idx,
+                        base_confidence,
+                    );
+
+                    if confidence <= 0.0 {
+                        continue;
                     }
 
-                    edges_to_add.push((from_idx, to_idx, reference.clone()));
-                    continue;
+                    edges_to_add.push((from_idx, to_idx, confidence));
                 }
-
-                // Unresolved: external/stdlib symbol — silently drop (expected)
-                #[cfg(debug_assertions)]
-                warn!(
-                    "Unresolved reference '{}' in {} (likely external/stdlib)",
-                    reference,
-                    from_file.display()
-                );
             }
         }
 
-        for (from_id, to_id, _) in edges_to_add {
-            self.graph
-                .add_edge(from_id, to_id, Edge::new(EdgeKind::Calls));
+        for (from_id, to_id, confidence) in edges_to_add {
+            self.graph.add_edge(
+                from_id,
+                to_id,
+                Edge::new(EdgeKind::Calls).with_confidence(confidence),
+            );
         }
+    }
+
+    /// Downgrades (rather than drops) an edge whose name is not imported.
+    ///
+    /// If the referencing file declares imports and this bare name is not among
+    /// them, a cross-module match is probably a same-name coincidence. The old
+    /// behaviour dropped such edges unless the target was in the same directory
+    /// — which meant that in a flat `src/` layout, the common case for JS and
+    /// Python projects, the check never fired at all. Confidence-weighting
+    /// applies the same suspicion uniformly instead of exempting whole layouts.
+    ///
+    /// Returns `0.0` to drop the edge entirely.
+    fn apply_import_validation(
+        &self,
+        reference: &str,
+        from_file: &Path,
+        from_file_str: &str,
+        to_idx: NodeId,
+        base_confidence: f32,
+    ) -> f32 {
+        let Some(file_imports) = self.import_map.get(from_file_str) else {
+            return base_confidence;
+        };
+        if file_imports.is_empty() || reference.contains('.') {
+            return base_confidence;
+        }
+        if file_imports.contains_key(reference) {
+            // Explicitly imported — the strongest possible corroboration.
+            return base_confidence.max(0.95);
+        }
+
+        let Some(to_node) = self.graph.get(to_idx) else {
+            return 0.0;
+        };
+        let to_file = PathBuf::from(&to_node.file);
+
+        if to_file == from_file {
+            // Defined in this very file; imports are irrelevant.
+            return base_confidence;
+        }
+
+        if to_file.parent() == from_file.parent() {
+            // Same directory but never imported. Plausible in languages with
+            // implicit module scope, suspicious everywhere else.
+            return base_confidence * 0.6;
+        }
+
+        // Different module and not imported: almost certainly a name collision.
+        warn!(
+            "Downgrading unimported cross-module reference '{}' in {} → {}",
+            reference,
+            from_file.display(),
+            to_file.display()
+        );
+        base_confidence * 0.3
     }
 
     /// Finishes building and returns the graph.
@@ -335,6 +388,149 @@ mod tests {
         let graph = builder.build();
         assert_eq!(graph.node_count(), 0);
         assert_eq!(graph.edge_count(), 0);
+    }
+
+    /// Confidence of the single edge in the graph.
+    fn only_edge_confidence(graph: &ArborGraph) -> f32 {
+        let edges = graph.export_edges();
+        assert_eq!(edges.len(), 1, "expected exactly one edge");
+        graph
+            .graph
+            .edge_weights()
+            .next()
+            .expect("edge weight")
+            .confidence
+    }
+
+    #[test]
+    fn exact_fqn_match_is_full_confidence() {
+        let mut b = GraphBuilder::new();
+        let caller = CodeNode::new("main", "main", NodeKind::Function, "main.rs")
+            .with_references(vec!["pkg.Utils.helper".to_string()]);
+        let mut callee = CodeNode::new("helper", "helper", NodeKind::Method, "utils.rs");
+        callee.qualified_name = "pkg.Utils.helper".to_string();
+        b.add_nodes(vec![caller, callee]);
+        let graph = b.build();
+
+        assert_eq!(only_edge_confidence(&graph), 1.0);
+    }
+
+    #[test]
+    fn colliding_symbols_both_remain_reachable() {
+        // The old table overwrote one of these, orphaning it with zero callers.
+        let mut b = GraphBuilder::new();
+        let caller = CodeNode::new("main", "main", NodeKind::Function, "src/main.py")
+            .with_references(vec!["process".to_string()]);
+        b.add_nodes(vec![caller]);
+        b.add_nodes(vec![CodeNode::new(
+            "process",
+            "process",
+            NodeKind::Function,
+            "src/utils.py",
+        )]);
+        b.add_nodes(vec![CodeNode::new(
+            "process",
+            "process",
+            NodeKind::Function,
+            "src/helpers.py",
+        )]);
+        let graph = b.build();
+
+        // Both candidates are linked, each flagged as uncertain.
+        assert_eq!(graph.edge_count(), 2);
+        for weight in graph.graph.edge_weights() {
+            assert!(
+                !weight.is_confident(),
+                "ambiguous resolution must not claim certainty"
+            );
+        }
+    }
+
+    #[test]
+    fn unimported_cross_module_reference_is_downgraded_not_dropped() {
+        let mut b = GraphBuilder::new();
+        let import = CodeNode::new("./other", "./other", NodeKind::Import, "src/a/main.ts")
+            .with_references(vec!["somethingElse".to_string()]);
+        let caller = CodeNode::new("main", "main", NodeKind::Function, "src/a/main.ts")
+            .with_references(vec!["validate".to_string()]);
+        let callee = CodeNode::new("validate", "validate", NodeKind::Function, "src/z/far.ts");
+        b.add_nodes(vec![import, caller, callee]);
+        let graph = b.build();
+
+        let confidence = only_edge_confidence(&graph);
+        assert!(
+            confidence > 0.0 && confidence < 0.5,
+            "not imported and in another module — weak, got {confidence}"
+        );
+    }
+
+    #[test]
+    fn explicitly_imported_reference_is_strong() {
+        let mut b = GraphBuilder::new();
+        let import = CodeNode::new("./far", "./far", NodeKind::Import, "src/a/main.ts")
+            .with_references(vec!["validate".to_string()]);
+        let caller = CodeNode::new("main", "main", NodeKind::Function, "src/a/main.ts")
+            .with_references(vec!["validate".to_string()]);
+        let callee = CodeNode::new("validate", "validate", NodeKind::Function, "src/z/far.ts");
+        b.add_nodes(vec![import, caller, callee]);
+        let graph = b.build();
+
+        assert!(
+            only_edge_confidence(&graph) >= Edge::CONFIDENT_THRESHOLD,
+            "an explicit import is strong corroboration"
+        );
+    }
+
+    #[test]
+    fn same_dir_unimported_reference_is_no_longer_a_free_pass() {
+        // Flat `src/` layouts made the old filter a no-op, so same-name
+        // collisions sailed through at full strength.
+        let mut b = GraphBuilder::new();
+        let import = CodeNode::new("./x", "./x", NodeKind::Import, "src/main.ts")
+            .with_references(vec!["other".to_string()]);
+        let caller = CodeNode::new("main", "main", NodeKind::Function, "src/main.ts")
+            .with_references(vec!["validate".to_string()]);
+        let callee = CodeNode::new("validate", "validate", NodeKind::Function, "src/sibling.ts");
+        b.add_nodes(vec![import, caller, callee]);
+        let graph = b.build();
+
+        let confidence = only_edge_confidence(&graph);
+        assert!(
+            confidence < Edge::CONFIDENT_THRESHOLD,
+            "same-dir but unimported should carry doubt, got {confidence}"
+        );
+    }
+
+    #[test]
+    fn build_is_deterministic_across_insertion_orders() {
+        let make = |reverse: bool| {
+            let mut b = GraphBuilder::new();
+            let mut defs = vec![
+                CodeNode::new("run", "A.run", NodeKind::Method, "src/a/a.ts"),
+                CodeNode::new("run", "B.run", NodeKind::Method, "src/b/b.ts"),
+            ];
+            if reverse {
+                defs.reverse();
+            }
+            b.add_nodes(vec![CodeNode::new(
+                "main",
+                "main",
+                NodeKind::Function,
+                "src/c/main.ts",
+            )
+            .with_references(vec!["run".to_string()])]);
+            b.add_nodes(defs);
+            let graph = b.build();
+            let mut sig: Vec<String> = graph
+                .export_edges()
+                .into_iter()
+                .map(|e| format!("{}->{}", e.source, e.target))
+                .collect();
+            sig.sort();
+            sig
+        };
+
+        assert_eq!(make(false), make(true));
     }
 
     #[test]
