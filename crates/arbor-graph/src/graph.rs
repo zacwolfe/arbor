@@ -32,8 +32,12 @@ pub struct ArborGraph {
     /// Maps file paths to node IDs (for incremental updates).
     file_index: HashMap<String, Vec<NodeId>>,
 
-    /// Centrality scores for ranking.
+    /// Percentile-rank centrality, comparable across repositories.
     centrality: HashMap<NodeId, f64>,
+
+    /// Raw PageRank mass, kept so a recompute can warm-start from it.
+    #[serde(default)]
+    centrality_raw: HashMap<NodeId, f64>,
 
     /// Search index for fast substring queries.
     #[serde(skip)]
@@ -55,6 +59,7 @@ impl ArborGraph {
             name_index: HashMap::new(),
             file_index: HashMap::new(),
             centrality: HashMap::new(),
+            centrality_raw: HashMap::new(),
             search_index: SearchIndex::new(),
         }
     }
@@ -133,8 +138,7 @@ impl ArborGraph {
 
     /// Searches for nodes whose name contains the query.
     ///
-    /// Uses the search index for fast O(k) lookups where k is the number of matches,
-    /// instead of O(n) linear scan over all nodes.
+    /// Uses the search index for fast lookups instead of scanning all nodes.
     pub fn search(&self, query: &str) -> Vec<&CodeNode> {
         self.search_index
             .search(query)
@@ -226,19 +230,65 @@ impl ArborGraph {
         }
     }
 
-    /// Gets the centrality score for a node.
+    /// Centrality as a percentile rank in `[0.0, 1.0]`.
+    ///
+    /// `0.9` means "more central than 90% of the nodes in this repository",
+    /// and carries that meaning in every repository — so a threshold written
+    /// against it behaves the same on a god-object monolith and a flat service.
+    /// For the underlying PageRank mass see [`centrality_raw`](Self::centrality_raw).
     pub fn centrality(&self, index: NodeId) -> f64 {
         self.centrality.get(&index).copied().unwrap_or(0.0)
     }
 
-    /// Sets centrality scores (called after computation).
+    /// Raw PageRank mass for a node. Sums to ~1.0 across the graph.
+    pub fn centrality_raw(&self, index: NodeId) -> f64 {
+        self.centrality_raw.get(&index).copied().unwrap_or(0.0)
+    }
+
+    /// Iterates every edge weight, for density and confidence reporting.
+    pub fn edge_weights(&self) -> impl Iterator<Item = &Edge> {
+        self.graph.edge_weights()
+    }
+
+    /// Counts edges at or above [`Edge::CONFIDENT_THRESHOLD`].
+    ///
+    /// The gap between this and [`edge_count`](Self::edge_count) is how much of
+    /// the graph rests on inference rather than proof — worth surfacing in any
+    /// report that claims to describe what a change reaches.
+    pub fn confident_edge_count(&self) -> usize {
+        self.graph
+            .edge_weights()
+            .filter(|edge| edge.is_confident())
+            .count()
+    }
+
+    /// Sets percentile centrality scores.
+    ///
+    /// Prefer [`set_centrality_scores`](Self::set_centrality_scores), which
+    /// also stores the raw scores a warm start needs.
     pub fn set_centrality(&mut self, scores: HashMap<NodeId, f64>) {
         self.centrality = scores;
     }
 
-    /// Returns the full centrality score map (e.g. to warm-start a recompute).
+    /// Stores both the raw and percentile forms from a computation.
+    pub fn set_centrality_scores(&mut self, scores: crate::ranking::CentralityScores) {
+        let (raw, percentile) = scores.into_parts();
+        self.centrality_raw = raw;
+        self.centrality = percentile;
+    }
+
+    /// Raw score map, for warm-starting a recompute.
+    ///
+    /// Falls back to the percentile map when raw scores are absent — a graph
+    /// deserialized from a cache written before raw scores were stored. The
+    /// warm-start rescale in [`crate::ranking`] tolerates any scalar multiple
+    /// of the fixed point, so this degrades convergence speed, not correctness.
     pub fn centrality_map(&self) -> &HashMap<NodeId, f64> {
-        &self.centrality
+        if self.centrality_raw.is_empty() {
+            &self.centrality
+        } else {
+            &self.centrality_raw
+        }
     }
 
     /// Returns the number of nodes.
@@ -620,11 +670,7 @@ mod new_query_tests {
         let a = g.add_node(make_node("foo", NodeKind::Function, "src/a.rs"));
         let b = g.add_node(make_node("bar", NodeKind::Function, "src/a.rs"));
         let _c = g.add_node(make_node("baz", NodeKind::Function, "src/b.rs"));
-        g.add_edge(
-            a,
-            b,
-            Edge::new(EdgeKind::Calls),
-        );
+        g.add_edge(a, b, Edge::new(EdgeKind::Calls));
         let (nodes, edges) = g.nodes_in_file_with_edges("src/a.rs");
         assert_eq!(nodes.len(), 2);
         assert_eq!(edges.len(), 1);
@@ -639,13 +685,10 @@ mod new_query_tests {
         let a = g.add_node(make_node("foo", NodeKind::Function, "src/a.rs"));
         let c = g.add_node(make_node("baz", NodeKind::Function, "src/b.rs"));
         // Edge from a.rs to b.rs — should NOT appear in get_file_graph for a.rs
-        g.add_edge(
-            a,
-            c,
-            Edge::new(EdgeKind::Calls),
-        );
+        g.add_edge(a, c, Edge::new(EdgeKind::Calls));
         let (nodes, edges) = g.nodes_in_file_with_edges("src/a.rs");
         assert_eq!(nodes.len(), 1); // only foo
         assert_eq!(edges.len(), 0); // cross-file edge excluded
     }
 }
+

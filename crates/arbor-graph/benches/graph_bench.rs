@@ -83,7 +83,7 @@ fn bench_centrality_10k(c: &mut Criterion) {
 
 fn bench_centrality_10k_warm(c: &mut Criterion) {
     let graph = build_fan_graph(200, 49);
-    let previous = compute_centrality(&graph, 20, 0.85).into_map();
+    let previous = compute_centrality(&graph, 20, 0.85).into_raw_map();
     c.bench_function("compute_centrality_10k_warm", |b| {
         b.iter(|| black_box(compute_centrality_warm(&graph, 20, 0.85, Some(&previous))))
     });
