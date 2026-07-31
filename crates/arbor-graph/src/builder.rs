@@ -16,6 +16,14 @@ use tracing::warn;
 /// and linking to all of them would swamp the graph with noise.
 const MAX_AMBIGUOUS_FANOUT: usize = 4;
 
+/// Tighter fan-out cap for calls whose receiver type is unknown.
+const MAX_UNKNOWN_RECEIVER_FANOUT: usize = 2;
+
+/// Confidence multiplier for a call on a receiver we could not type
+/// (`userService.findOne()`). The method name is real evidence, but which
+/// `findOne` it reaches is a guess.
+const UNKNOWN_RECEIVER_PENALTY: f32 = 0.55;
+
 /// Builds an ArborGraph from parsed code nodes.
 pub struct GraphBuilder {
     graph: ArborGraph,
@@ -145,7 +153,19 @@ impl GraphBuilder {
             let from_file_str = from_file.to_string_lossy().to_string();
 
             for reference in references {
-                let resolution = self.symbol_table.resolve_ref(&reference, &from_file);
+                // A leading `.` marks a call on a receiver whose type we could
+                // not determine (`userService.findOne()`). Resolve it by method
+                // name, but never let it claim the confidence of a real match.
+                let (lookup, receiver_unknown) = match reference.strip_prefix('.') {
+                    Some(method) => (method, true),
+                    None => (reference.as_str(), false),
+                };
+
+                if lookup.is_empty() {
+                    continue;
+                }
+
+                let resolution = self.symbol_table.resolve_ref(lookup, &from_file);
 
                 if !resolution.is_resolved() {
                     #[cfg(debug_assertions)]
@@ -157,10 +177,22 @@ impl GraphBuilder {
                     continue;
                 }
 
-                let base_confidence = resolution.confidence();
+                let mut base_confidence = resolution.confidence();
+                if receiver_unknown {
+                    base_confidence *= UNKNOWN_RECEIVER_PENALTY;
+                }
                 let candidates = resolution.candidates();
 
-                if candidates.len() > MAX_AMBIGUOUS_FANOUT {
+                // A receiver-unknown call to a name shared by many symbols
+                // (`get`, `run`, `execute`) is pure noise; hold it to a tighter
+                // fan-out than a properly-qualified reference.
+                let fanout_limit = if receiver_unknown {
+                    MAX_UNKNOWN_RECEIVER_FANOUT
+                } else {
+                    MAX_AMBIGUOUS_FANOUT
+                };
+
+                if candidates.len() > fanout_limit {
                     // A name like `new`, `get`, or `run` with dozens of
                     // definitions carries no information. Linking to all of
                     // them would swamp the graph.
@@ -178,13 +210,20 @@ impl GraphBuilder {
                         continue;
                     }
 
-                    let confidence = self.apply_import_validation(
-                        &reference,
-                        &from_file,
-                        &from_file_str,
-                        to_idx,
-                        base_confidence,
-                    );
+                    // Method names are never in the import map — importing
+                    // `UserService` does not import `findOne` — so import
+                    // validation only applies to bare and qualified references.
+                    let confidence = if receiver_unknown {
+                        base_confidence
+                    } else {
+                        self.apply_import_validation(
+                            &reference,
+                            &from_file,
+                            &from_file_str,
+                            to_idx,
+                            base_confidence,
+                        )
+                    };
 
                     if confidence <= 0.0 {
                         continue;
@@ -413,6 +452,47 @@ mod tests {
         let graph = b.build();
 
         assert_eq!(only_edge_confidence(&graph), 1.0);
+    }
+
+    #[test]
+    fn unknown_receiver_call_creates_a_weak_edge() {
+        // `.findOne` — the shape the TS parser used to discard entirely.
+        let mut b = GraphBuilder::new();
+        let caller = CodeNode::new("handler", "handler", NodeKind::Function, "api.ts")
+            .with_references(vec![".findOne".to_string()]);
+        let callee = CodeNode::new("findOne", "UserRepo.findOne", NodeKind::Method, "repo.ts");
+        b.add_nodes(vec![caller, callee]);
+        let graph = b.build();
+
+        let confidence = only_edge_confidence(&graph);
+        assert!(
+            confidence > 0.0 && confidence < Edge::CONFIDENT_THRESHOLD,
+            "edge should exist but not be treated as proven, got {confidence}"
+        );
+    }
+
+    #[test]
+    fn unknown_receiver_with_many_candidates_is_not_linked() {
+        // `.get` defined on three different types is noise, not evidence.
+        let mut b = GraphBuilder::new();
+        let caller = CodeNode::new("handler", "handler", NodeKind::Function, "api.ts")
+            .with_references(vec![".get".to_string()]);
+        b.add_nodes(vec![caller]);
+        for (i, owner) in ["Cache", "Store", "Config"].iter().enumerate() {
+            b.add_nodes(vec![CodeNode::new(
+                "get",
+                format!("{owner}.get"),
+                NodeKind::Method,
+                format!("m{i}.ts"),
+            )]);
+        }
+        let graph = b.build();
+
+        assert_eq!(
+            graph.edge_count(),
+            0,
+            "over the fan-out cap, so no edge should be guessed"
+        );
     }
 
     #[test]
