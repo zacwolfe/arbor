@@ -14,21 +14,95 @@ use std::collections::HashMap;
 /// the full iteration budget.
 const CONVERGENCE_EPSILON: f64 = 1e-9;
 
-/// Stores centrality scores after computation.
-#[derive(Debug, Default)]
+/// Centrality scores in two forms.
+///
+/// # Why two
+///
+/// Raw PageRank mass sums to 1.0 across the graph, so an individual value
+/// shrinks as the repository grows and means nothing on its own. The previous
+/// implementation divided every score by the maximum, which fixed the range but
+/// produced values that are not comparable between repositories: the top node
+/// is 1.0 *by construction* whether it has four callers or four hundred, and a
+/// threshold like `0.6` therefore means "60% as central as whatever the biggest
+/// thing here happens to be." In a repo with one god object nothing ever
+/// cleared it; in a flat repo almost everything did. Worse, adding a single new
+/// hub rescaled every other node in the graph.
+///
+/// [`percentile`](Self::percentile) is the comparable form — `0.6` means "more
+/// central than 60% of this repository" everywhere — and is what thresholds
+/// should use. [`raw`](Self::raw) is the true fixed point, kept because
+/// warm-start recomputation needs it.
+#[derive(Debug, Default, Clone)]
 pub struct CentralityScores {
-    scores: HashMap<NodeId, f64>,
+    raw: HashMap<NodeId, f64>,
+    percentile: HashMap<NodeId, f64>,
 }
 
 impl CentralityScores {
-    /// Gets the score for a node.
+    /// Percentile rank in `[0.0, 1.0]` — comparable across repositories.
     pub fn get(&self, id: NodeId) -> f64 {
-        self.scores.get(&id).copied().unwrap_or(0.0)
+        self.percentile.get(&id).copied().unwrap_or(0.0)
     }
 
-    /// Converts to a HashMap for storage in the graph.
+    /// Raw PageRank mass. Sums to ~1.0 across the graph.
+    pub fn get_raw(&self, id: NodeId) -> f64 {
+        self.raw.get(&id).copied().unwrap_or(0.0)
+    }
+
+    /// Percentile map, for display and thresholding.
     pub fn into_map(self) -> HashMap<NodeId, f64> {
-        self.scores
+        self.percentile
+    }
+
+    /// Raw map, for warm-starting a later recompute.
+    pub fn into_raw_map(self) -> HashMap<NodeId, f64> {
+        self.raw
+    }
+
+    /// Both maps as `(raw, percentile)`.
+    pub fn into_parts(self) -> (HashMap<NodeId, f64>, HashMap<NodeId, f64>) {
+        (self.raw, self.percentile)
+    }
+
+    /// Builds percentile ranks from raw scores.
+    ///
+    /// A node's percentile is the fraction of nodes scoring strictly below it,
+    /// so tied nodes share a rank and the ordering is total and deterministic.
+    fn from_raw(nodes: Vec<NodeId>, scores: Vec<f64>) -> Self {
+        let n = scores.len();
+        let mut percentile = vec![0.0f64; n];
+
+        if n == 1 {
+            percentile[0] = 1.0;
+        } else if n > 1 {
+            let mut order: Vec<usize> = (0..n).collect();
+            // Tie-break on index so the order never depends on hash iteration.
+            order.sort_by(|&a, &b| {
+                scores[a]
+                    .partial_cmp(&scores[b])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.cmp(&b))
+            });
+
+            let denom = (n - 1) as f64;
+            let mut i = 0;
+            while i < n {
+                let mut j = i;
+                while j + 1 < n && scores[order[j + 1]] == scores[order[i]] {
+                    j += 1;
+                }
+                let rank = i as f64 / denom;
+                for slot in &order[i..=j] {
+                    percentile[*slot] = rank;
+                }
+                i = j + 1;
+            }
+        }
+
+        Self {
+            raw: nodes.iter().copied().zip(scores).collect(),
+            percentile: nodes.into_iter().zip(percentile).collect(),
+        }
     }
 }
 
@@ -63,7 +137,8 @@ fn is_test_file(file: &str) -> bool {
 /// 2. Each iteration distributes scores along edges
 /// 3. Callers from test/spec/fixture files contribute 10x less weight
 ///    — prevents test utilities from appearing more central than production code
-/// 4. Scores are normalized to [0.0, 1.0]
+/// 4. Raw scores are converted to percentile ranks for cross-repo comparability
+///    (see [`CentralityScores`])
 ///
 /// # Arguments
 ///
@@ -146,12 +221,13 @@ pub fn compute_centrality_warm(
                 .iter()
                 .map(|id| prev.get(id).copied().unwrap_or(initial_score))
                 .collect();
-            // Stored scores are max-normalized, i.e. a scalar multiple c of the
-            // iteration's fixed point. Left as-is they start far from it and the
-            // warm start saves nothing. For v ≈ c·x*, summing the fixed-point
-            // equation gives c = 1 − (f(v) − Σv) / (n·base) where
-            // f(v) = n·base + damping·Σ gather(v) — so one pass over the edges
-            // recovers c and v/c lands next to the fixed point.
+            // Stored scores may be any scalar multiple c of the iteration's
+            // fixed point. For raw scores (what `centrality_map` now returns)
+            // c ≈ 1 and this is a no-op; the rescale is kept so a caller that
+            // hands us normalized scores still converges. For v ≈ c·x*, summing
+            // the fixed-point equation gives c = 1 − (f(v) − Σv) / (n·base)
+            // where f(v) = n·base + damping·Σ gather(v) — so one pass over the
+            // edges recovers c and v/c lands next to the fixed point.
             let sum_v: f64 = warm.iter().sum();
             let f_v: f64 =
                 n as f64 * base + damping * (0..n).map(|t| gather(&warm, t)).sum::<f64>();
@@ -180,17 +256,7 @@ pub fn compute_centrality_warm(
         }
     }
 
-    // Normalize to [0, 1] range
-    let max_score = scores.iter().cloned().fold(0.0f64, f64::max);
-    if max_score > 0.0 {
-        for score in scores.iter_mut() {
-            *score /= max_score;
-        }
-    }
-
-    CentralityScores {
-        scores: nodes.into_iter().zip(scores).collect(),
-    }
+    CentralityScores::from_raw(nodes, scores)
 }
 
 #[cfg(test)]
@@ -203,7 +269,7 @@ mod tests {
     fn test_centrality_empty_graph() {
         let graph = ArborGraph::new();
         let scores = compute_centrality(&graph, 10, 0.85);
-        assert!(scores.scores.is_empty());
+        assert!(scores.percentile.is_empty());
     }
 
     #[test]
@@ -213,7 +279,7 @@ mod tests {
         graph.add_node(node);
 
         let scores = compute_centrality(&graph, 10, 0.85);
-        assert_eq!(scores.scores.len(), 1);
+        assert_eq!(scores.percentile.len(), 1);
     }
 
     #[test]
@@ -317,5 +383,128 @@ mod tests {
             scores.get(b) > scores.get(c),
             "import edges must not count as calls"
         );
+    }
+
+    /// Builds a star: `spokes` callers all pointing at one hub.
+    fn star(spokes: usize) -> (ArborGraph, NodeId) {
+        let mut graph = ArborGraph::new();
+        let hub = graph.add_node(CodeNode::new("hub", "hub", NodeKind::Function, "hub.rs"));
+        for i in 0..spokes {
+            let name = format!("s{i}");
+            let s = graph.add_node(CodeNode::new(
+                name.clone(),
+                name,
+                NodeKind::Function,
+                format!("s{i}.rs"),
+            ));
+            graph.add_edge(s, hub, Edge::new(EdgeKind::Calls));
+        }
+        (graph, hub)
+    }
+
+    #[test]
+    fn percentile_is_comparable_across_graph_shapes() {
+        // The old max-normalization gave the hub exactly 1.0 in both graphs and
+        // told you nothing about how it compared to its peers. Percentile still
+        // ranks the hub top, but every other node now sits at a rank that means
+        // the same thing in both repos.
+        let (small, small_hub) = star(3);
+        let (large, large_hub) = star(60);
+
+        let small_scores = compute_centrality(&small, 20, 0.85);
+        let large_scores = compute_centrality(&large, 20, 0.85);
+
+        assert_eq!(small_scores.get(small_hub), 1.0);
+        assert_eq!(large_scores.get(large_hub), 1.0);
+
+        // Spokes are all tied at the bottom in both graphs.
+        for (graph, scores) in [(&small, &small_scores), (&large, &large_scores)] {
+            for idx in graph.node_indexes() {
+                let is_hub = graph.get(idx).map(|n| n.name == "hub").unwrap_or(false);
+                if !is_hub {
+                    assert_eq!(scores.get(idx), 0.0, "tied spokes share the bottom rank");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn adding_a_hub_does_not_rescale_unrelated_nodes() {
+        // Under max-normalization, introducing a bigger hub divided every other
+        // node's score by a larger maximum, silently changing the reported
+        // centrality — and therefore the risk level — of untouched code.
+        let mut graph = ArborGraph::new();
+        let a = graph.add_node(CodeNode::new("a", "a", NodeKind::Function, "a.rs"));
+        let b = graph.add_node(CodeNode::new("b", "b", NodeKind::Function, "b.rs"));
+        let c = graph.add_node(CodeNode::new("c", "c", NodeKind::Function, "c.rs"));
+        graph.add_edge(a, b, Edge::new(EdgeKind::Calls));
+        graph.add_edge(c, b, Edge::new(EdgeKind::Calls));
+
+        let before = compute_centrality(&graph, 20, 0.85).get(b);
+
+        // Add a far more connected hub elsewhere in the repo.
+        let hub = graph.add_node(CodeNode::new("hub", "hub", NodeKind::Function, "hub.rs"));
+        for i in 0..20 {
+            let name = format!("x{i}");
+            let x = graph.add_node(CodeNode::new(
+                name.clone(),
+                name,
+                NodeKind::Function,
+                format!("x{i}.rs"),
+            ));
+            graph.add_edge(x, hub, Edge::new(EdgeKind::Calls));
+        }
+
+        let after = compute_centrality(&graph, 20, 0.85).get(b);
+
+        // b is still ranked above the leaf callers that make up the bulk of the
+        // graph; it did not collapse toward zero just because a hub appeared.
+        assert!(
+            after > 0.5,
+            "b should remain in the upper half, got {after} (was {before})"
+        );
+    }
+
+    #[test]
+    fn percentile_ties_are_stable_and_ordering_preserved() {
+        let (graph, hub) = star(5);
+        let scores = compute_centrality(&graph, 20, 0.85);
+
+        // Recomputing must give identical values — no hash-order dependence.
+        let again = compute_centrality(&graph, 20, 0.85);
+        for idx in graph.node_indexes() {
+            assert_eq!(scores.get(idx), again.get(idx));
+            assert_eq!(scores.get_raw(idx), again.get_raw(idx));
+        }
+
+        // Raw ordering must agree with percentile ordering.
+        for idx in graph.node_indexes() {
+            if idx != hub {
+                assert!(scores.get_raw(hub) > scores.get_raw(idx));
+                assert!(scores.get(hub) > scores.get(idx));
+            }
+        }
+    }
+
+    #[test]
+    fn single_node_graph_is_top_ranked() {
+        let mut graph = ArborGraph::new();
+        let only = graph.add_node(CodeNode::new("solo", "solo", NodeKind::Function, "a.rs"));
+        let scores = compute_centrality(&graph, 20, 0.85);
+        assert_eq!(scores.get(only), 1.0);
+    }
+
+    #[test]
+    fn warm_start_from_raw_matches_cold_result() {
+        let (graph, _) = star(30);
+        let cold = compute_centrality(&graph, 20, 0.85);
+        let warm = compute_centrality_warm(&graph, 20, 0.85, Some(&cold.clone().into_raw_map()));
+
+        for idx in graph.node_indexes() {
+            assert!(
+                (cold.get_raw(idx) - warm.get_raw(idx)).abs() < 1e-9,
+                "warm start must converge to the same fixed point"
+            );
+        }
     }
 }

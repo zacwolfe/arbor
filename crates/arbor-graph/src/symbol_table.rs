@@ -1,40 +1,166 @@
+//! Cross-file symbol resolution.
+//!
+//! Maps Fully Qualified Names (FQNs) to graph nodes and resolves bare or
+//! partially-qualified references against them.
+//!
+//! # Determinism
+//!
+//! Every lookup path in this module is order-independent. Candidate lists are
+//! sorted by `(file, node index)` before any pick is made, and no decision ever
+//! depends on `HashMap` iteration order — Rust seeds `RandomState` per process,
+//! so iterating a map to choose a winner would make graph construction vary
+//! between runs of the same binary on the same input.
+//!
+//! # Collisions
+//!
+//! An FQN can legitimately map to several nodes: `handler` in twelve route
+//! files, `new` on forty structs, `process` in both `utils.py` and `helpers.py`.
+//! The table keeps every entry and reports ambiguity to the caller rather than
+//! silently overwriting, which would orphan the loser and produce a false
+//! negative in blast radius.
+
 use crate::graph::NodeId;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+/// One definition of a symbol.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymbolEntry {
+    pub id: NodeId,
+    pub file: PathBuf,
+}
+
+/// How a reference was matched, ordered from most to least trustworthy.
+///
+/// The variant determines the confidence stamped on the resulting edge, so a
+/// downstream consumer can tell a certain call from an educated guess.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Resolution {
+    /// Exact FQN match with exactly one definition.
+    Exact(NodeId),
+    /// Matched a symbol defined in the referencing file.
+    SameFile(NodeId),
+    /// Suffix match with exactly one definition repo-wide.
+    UniqueSuffix(NodeId),
+    /// Several candidates; exactly one lives in the referencing file's directory.
+    SameDir(NodeId),
+    /// Several equally-plausible candidates, sorted deterministically.
+    Ambiguous(Vec<NodeId>),
+    /// No definition in this repository (external or stdlib).
+    Unresolved,
+}
+
+impl Resolution {
+    /// Confidence to stamp on an edge created from this resolution.
+    ///
+    /// `Ambiguous` is deliberately low rather than zero: the reference does
+    /// point at *something* in the repo, we just cannot say which. Consumers
+    /// that need certainty should filter on this value.
+    pub fn confidence(&self) -> f32 {
+        match self {
+            Resolution::Exact(_) => 1.0,
+            Resolution::SameFile(_) => 0.95,
+            Resolution::UniqueSuffix(_) => 0.80,
+            Resolution::SameDir(_) => 0.55,
+            Resolution::Ambiguous(_) => 0.25,
+            Resolution::Unresolved => 0.0,
+        }
+    }
+
+    /// The single resolved node, if this resolution picked one.
+    pub fn node(&self) -> Option<NodeId> {
+        match self {
+            Resolution::Exact(id)
+            | Resolution::SameFile(id)
+            | Resolution::UniqueSuffix(id)
+            | Resolution::SameDir(id) => Some(*id),
+            Resolution::Ambiguous(_) | Resolution::Unresolved => None,
+        }
+    }
+
+    /// Every candidate this resolution considered plausible.
+    pub fn candidates(&self) -> Vec<NodeId> {
+        match self {
+            Resolution::Ambiguous(ids) => ids.clone(),
+            other => other.node().into_iter().collect(),
+        }
+    }
+
+    pub fn is_resolved(&self) -> bool {
+        !matches!(self, Resolution::Unresolved)
+    }
+}
 
 /// A global symbol table for resolving cross-file references.
-///
-/// Maps Fully Qualified Names (FQNs) to Node IDs.
-/// Example FQN: "arbor::graph::SymbolTable" -> NodeId(42)
 #[derive(Debug, Default, Clone)]
 pub struct SymbolTable {
-    /// Map of FQN to NodeId
-    by_fqn: HashMap<String, NodeId>,
+    /// FQN → every node defining it.
+    by_fqn: HashMap<String, Vec<SymbolEntry>>,
 
-    /// Map of File Path to list of exported symbols (FQNs)
-    /// Used to resolve wildcard imports or find all symbols in a file.
+    /// Segment-aligned suffix → FQNs ending with it.
+    ///
+    /// `pkg.Utils.helper` is indexed under `helper`, `Utils.helper`, and
+    /// `pkg.Utils.helper`, so resolving a bare `helper` is an O(1) lookup
+    /// instead of a scan over every FQN in the repository.
+    by_suffix: HashMap<String, Vec<String>>,
+
+    /// File → FQNs it defines.
     exports_by_file: HashMap<PathBuf, Vec<String>>,
 }
 
 impl SymbolTable {
-    /// Creates a new empty symbol table.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Registers a symbol in the table.
+    /// Registers a symbol definition.
     ///
-    /// * `fqn` - Fully Qualified Name (e.g., "pkg.module.function")
-    /// * `id` - The Node ID in the graph
-    /// * `file` - The file path defining this symbol
+    /// Repeated FQNs accumulate instead of overwriting.
     pub fn insert(&mut self, fqn: String, id: NodeId, file: PathBuf) {
-        self.by_fqn.insert(fqn.clone(), id);
-        self.exports_by_file.entry(file).or_default().push(fqn);
+        let entry = SymbolEntry {
+            id,
+            file: file.clone(),
+        };
+
+        let entries = self.by_fqn.entry(fqn.clone()).or_default();
+        // Guard against the same definition being indexed twice (incremental
+        // re-parse of an unchanged file).
+        if !entries.contains(&entry) {
+            entries.push(entry);
+        }
+
+        for suffix in segment_suffixes(&fqn) {
+            let fqns = self.by_suffix.entry(suffix.to_string()).or_default();
+            if !fqns.iter().any(|f| f == &fqn) {
+                fqns.push(fqn.clone());
+            }
+        }
+
+        let exports = self.exports_by_file.entry(file).or_default();
+        if !exports.contains(&fqn) {
+            exports.push(fqn);
+        }
     }
 
-    /// Resolves a Fully Qualified Name to a Node ID.
+    /// Resolves an exact FQN, but only when the definition is unambiguous.
+    ///
+    /// Returns `None` for a colliding FQN so the caller can fall back to
+    /// context-aware resolution rather than picking a definition at random.
     pub fn resolve(&self, fqn: &str) -> Option<NodeId> {
-        self.by_fqn.get(fqn).copied()
+        match self.by_fqn.get(fqn) {
+            Some(entries) if entries.len() == 1 => Some(entries[0].id),
+            _ => None,
+        }
+    }
+
+    /// All nodes defining this exact FQN, in deterministic order.
+    pub fn resolve_all(&self, fqn: &str) -> Vec<NodeId> {
+        let Some(entries) = self.by_fqn.get(fqn) else {
+            return Vec::new();
+        };
+        let mut entries: Vec<&SymbolEntry> = entries.iter().collect();
+        sort_entries(&mut entries);
+        entries.into_iter().map(|e| e.id).collect()
     }
 
     /// Returns all symbols exported by a file.
@@ -42,170 +168,365 @@ impl SymbolTable {
         self.exports_by_file.get(file)
     }
 
-    /// Clears the symbol table.
     pub fn clear(&mut self) {
         self.by_fqn.clear();
+        self.by_suffix.clear();
         self.exports_by_file.clear();
     }
 
-    /// Resolves a symbol name with context-aware matching.
+    /// Resolves a reference, preferring locality and reporting ambiguity.
     ///
-    /// Resolution order:
-    /// 1. Exact FQN match
-    /// 2. Suffix match (e.g., "helper" matches "pkg.Utils.helper")
-    ///    - Only matches if unambiguous OR in same directory as `context_file`
-    ///
-    /// Returns None if:
-    /// - No match found
-    /// - Multiple matches exist and none are in the same directory (ambiguous)
-    pub fn resolve_with_context(
-        &self,
-        name: &str,
-        context_file: &std::path::Path,
-    ) -> Option<NodeId> {
-        // 1. Try exact match first
-        if let Some(id) = self.by_fqn.get(name) {
-            return Some(*id);
+    /// Order:
+    ///   1. Exact FQN, unique → `Exact`
+    ///   2. Candidate gathering: exact-FQN entries plus every segment-aligned
+    ///      suffix match, deduplicated and sorted
+    ///   3. Single candidate → `Exact` / `UniqueSuffix`
+    ///   4. Exactly one candidate in the referencing file → `SameFile`
+    ///   5. Exactly one candidate in the referencing directory → `SameDir`
+    ///   6. Otherwise → `Ambiguous`
+    pub fn resolve_ref(&self, name: &str, context_file: &Path) -> Resolution {
+        let exact = self.by_fqn.get(name);
+        if let Some(entries) = exact {
+            if entries.len() == 1 {
+                return Resolution::Exact(entries[0].id);
+            }
+        }
+        let had_exact = exact.is_some();
+
+        let mut candidates: Vec<&SymbolEntry> = Vec::new();
+        let mut seen: Vec<NodeId> = Vec::new();
+
+        if let Some(entries) = exact {
+            for e in entries {
+                if !seen.contains(&e.id) {
+                    seen.push(e.id);
+                    candidates.push(e);
+                }
+            }
         }
 
-        // 2. Suffix match
+        if let Some(fqns) = self.by_suffix.get(name) {
+            // `by_suffix` values are insertion-ordered Vecs, but sort the FQN
+            // list anyway so candidate order never depends on parse order.
+            let mut fqns: Vec<&String> = fqns.iter().collect();
+            fqns.sort();
+            for fqn in fqns {
+                if let Some(entries) = self.by_fqn.get(fqn) {
+                    for e in entries {
+                        if !seen.contains(&e.id) {
+                            seen.push(e.id);
+                            candidates.push(e);
+                        }
+                    }
+                }
+            }
+        }
+
+        if candidates.is_empty() {
+            return Resolution::Unresolved;
+        }
+
+        sort_entries(&mut candidates);
+
+        if candidates.len() == 1 {
+            return if had_exact {
+                Resolution::Exact(candidates[0].id)
+            } else {
+                Resolution::UniqueSuffix(candidates[0].id)
+            };
+        }
+
+        let same_file: Vec<&SymbolEntry> = candidates
+            .iter()
+            .copied()
+            .filter(|e| e.file == context_file)
+            .collect();
+        if same_file.len() == 1 {
+            return Resolution::SameFile(same_file[0].id);
+        }
+
         let context_dir = context_file.parent();
-        let mut candidates: Vec<(&String, NodeId, bool)> = Vec::new();
-
-        for (fqn, &id) in &self.by_fqn {
-            // Check if FQN ends with the name (with separator)
-            if fqn.ends_with(name) {
-                // Ensure it's a proper suffix (preceded by separator or start)
-                let prefix_len = fqn.len() - name.len();
-                if prefix_len == 0
-                    || fqn.chars().nth(prefix_len - 1) == Some('.')
-                    || fqn.chars().nth(prefix_len - 1) == Some(':')
-                {
-                    // Check if in same directory
-                    let same_dir = self
-                        .exports_by_file
-                        .iter()
-                        .find(|(_, exports)| exports.contains(fqn))
-                        .map(|(file, _)| file.parent() == context_dir)
-                        .unwrap_or(false);
-
-                    candidates.push((fqn, id, same_dir));
-                }
-            }
+        let same_dir: Vec<&SymbolEntry> = candidates
+            .iter()
+            .copied()
+            .filter(|e| e.file.parent() == context_dir)
+            .collect();
+        if same_dir.len() == 1 {
+            return Resolution::SameDir(same_dir[0].id);
         }
 
-        match candidates.len() {
-            0 => None,
-            1 => Some(candidates[0].1),
-            _ => {
-                // Multiple candidates: only resolve if exactly one is in same directory
-                let same_dir_candidates: Vec<_> =
-                    candidates.iter().filter(|(_, _, same)| *same).collect();
-                if same_dir_candidates.len() == 1 {
-                    Some(same_dir_candidates[0].1)
-                } else {
-                    // Ambiguous: don't auto-link
-                    None
-                }
-            }
+        Resolution::Ambiguous(candidates.into_iter().map(|e| e.id).collect())
+    }
+
+    /// Back-compatible wrapper returning only a confidently-resolved node.
+    pub fn resolve_with_context(&self, name: &str, context_file: &Path) -> Option<NodeId> {
+        self.resolve_ref(name, context_file).node()
+    }
+
+    /// Number of distinct FQNs registered.
+    pub fn len(&self) -> usize {
+        self.by_fqn.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_fqn.is_empty()
+    }
+}
+
+/// Sorts entries by `(file, node index)` for a total, parse-order-independent order.
+fn sort_entries(entries: &mut [&SymbolEntry]) {
+    entries.sort_by(|a, b| {
+        a.file
+            .cmp(&b.file)
+            .then_with(|| a.id.index().cmp(&b.id.index()))
+    });
+}
+
+/// Every segment-aligned suffix of an FQN, including the FQN itself.
+///
+/// `a.b.c` → `["a.b.c", "b.c", "c"]`; `a::b::c` → `["a::b::c", "b::c", "c"]`.
+///
+/// Only positions immediately after a `.` or `:` qualify, so `helper` never
+/// matches the tail of `my_helper`. A suffix that would itself start with a
+/// separator (the middle of Rust's `::`) is skipped.
+fn segment_suffixes(fqn: &str) -> Vec<&str> {
+    let mut out = vec![fqn];
+    let bytes = fqn.as_bytes();
+
+    for (i, c) in fqn.char_indices().skip(1) {
+        if c == '.' || c == ':' {
+            continue;
+        }
+        // `i` is a char boundary, so `bytes[i - 1]` is either the whole
+        // previous char (ASCII) or a UTF-8 continuation byte (>= 0x80),
+        // which can never equal `.` or `:`.
+        let prev = bytes[i - 1];
+        if prev == b'.' || prev == b':' {
+            out.push(&fqn[i..]);
         }
     }
+
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn nid(n: usize) -> NodeId {
+        petgraph::graph::NodeIndex::new(n)
+    }
+
     #[test]
-    fn test_insert_resolve() {
+    fn insert_resolve() {
         let mut table = SymbolTable::new();
         let path = PathBuf::from("main.rs");
-        let id = NodeId::new(1);
+        table.insert("main::foo".to_string(), nid(1), path.clone());
 
-        table.insert("main::foo".to_string(), id, path.clone());
-
-        assert_eq!(table.resolve("main::foo"), Some(id));
+        assert_eq!(table.resolve("main::foo"), Some(nid(1)));
         assert_eq!(table.resolve("main::bar"), None);
-
-        let exports = table.get_file_exports(&path).unwrap();
-        assert_eq!(exports.len(), 1);
-        assert_eq!(exports[0], "main::foo");
+        assert_eq!(table.get_file_exports(&path).unwrap(), &vec!["main::foo"]);
     }
 
     #[test]
-    fn test_resolve_with_context_exact_match() {
+    fn exact_match_from_any_context() {
         let mut table = SymbolTable::new();
-        let path = PathBuf::from("src/utils.rs");
-        let id = NodeId::new(1);
+        table.insert(
+            "pkg.utils.helper".to_string(),
+            nid(1),
+            PathBuf::from("src/utils.rs"),
+        );
 
-        table.insert("pkg.utils.helper".to_string(), id, path.clone());
-
-        // Exact match works from any context
-        let result =
-            table.resolve_with_context("pkg.utils.helper", &PathBuf::from("other/file.rs"));
-        assert_eq!(result, Some(id));
+        let r = table.resolve_ref("pkg.utils.helper", Path::new("other/file.rs"));
+        assert_eq!(r, Resolution::Exact(nid(1)));
+        assert_eq!(r.confidence(), 1.0);
     }
 
     #[test]
-    fn test_resolve_with_context_suffix_match() {
+    fn unique_suffix_match() {
         let mut table = SymbolTable::new();
-        let path = PathBuf::from("src/utils.rs");
-        let id = NodeId::new(1);
+        table.insert(
+            "pkg.utils.helper".to_string(),
+            nid(1),
+            PathBuf::from("src/utils.rs"),
+        );
 
-        table.insert("pkg.utils.helper".to_string(), id, path.clone());
-
-        // Suffix match works when unambiguous
-        let result = table.resolve_with_context("helper", &PathBuf::from("other/file.rs"));
-        assert_eq!(result, Some(id));
+        let r = table.resolve_ref("helper", Path::new("other/file.rs"));
+        assert_eq!(r, Resolution::UniqueSuffix(nid(1)));
     }
 
     #[test]
-    fn test_resolve_with_context_ambiguous_returns_none() {
+    fn multi_segment_suffix_match() {
         let mut table = SymbolTable::new();
-        let id1 = NodeId::new(1);
-        let id2 = NodeId::new(2);
+        table.insert(
+            "pkg.Utils.helper".to_string(),
+            nid(1),
+            PathBuf::from("src/utils.rs"),
+        );
 
-        // Two helpers in different directories
+        let r = table.resolve_ref("Utils.helper", Path::new("other/file.rs"));
+        assert_eq!(r, Resolution::UniqueSuffix(nid(1)));
+    }
+
+    #[test]
+    fn suffix_must_be_segment_aligned() {
+        let mut table = SymbolTable::new();
+        table.insert(
+            "pkg.my_helper".to_string(),
+            nid(1),
+            PathBuf::from("src/utils.rs"),
+        );
+
+        // `helper` is a character-suffix of `my_helper` but not a segment.
+        assert_eq!(
+            table.resolve_ref("helper", Path::new("other/file.rs")),
+            Resolution::Unresolved
+        );
+    }
+
+    #[test]
+    fn ambiguous_reports_all_candidates() {
+        let mut table = SymbolTable::new();
         table.insert(
             "pkg.a.helper".to_string(),
-            id1,
+            nid(1),
             PathBuf::from("src/a/mod.rs"),
         );
         table.insert(
             "pkg.b.helper".to_string(),
-            id2,
+            nid(2),
             PathBuf::from("src/b/mod.rs"),
         );
 
-        // Ambiguous: from unrelated directory, should return None
-        let result = table.resolve_with_context("helper", &PathBuf::from("src/c/caller.rs"));
-        assert_eq!(result, None);
+        let r = table.resolve_ref("helper", Path::new("src/c/caller.rs"));
+        assert_eq!(r, Resolution::Ambiguous(vec![nid(1), nid(2)]));
+        assert!(r.node().is_none());
+        assert_eq!(r.candidates().len(), 2);
     }
 
     #[test]
-    fn test_resolve_with_context_locality_preference() {
+    fn locality_preference_same_dir() {
         let mut table = SymbolTable::new();
-        let id1 = NodeId::new(1);
-        let id2 = NodeId::new(2);
-
-        // Two helpers in different directories
         table.insert(
             "pkg.a.helper".to_string(),
-            id1,
+            nid(1),
             PathBuf::from("src/a/mod.rs"),
         );
         table.insert(
             "pkg.b.helper".to_string(),
-            id2,
+            nid(2),
             PathBuf::from("src/b/mod.rs"),
         );
 
-        // From src/a/, should resolve to id1 (same directory)
-        let result = table.resolve_with_context("helper", &PathBuf::from("src/a/caller.rs"));
-        assert_eq!(result, Some(id1));
+        assert_eq!(
+            table.resolve_ref("helper", Path::new("src/a/caller.rs")),
+            Resolution::SameDir(nid(1))
+        );
+        assert_eq!(
+            table.resolve_ref("helper", Path::new("src/b/caller.rs")),
+            Resolution::SameDir(nid(2))
+        );
+    }
 
-        // From src/b/, should resolve to id2 (same directory)
-        let result = table.resolve_with_context("helper", &PathBuf::from("src/b/caller.rs"));
-        assert_eq!(result, Some(id2));
+    #[test]
+    fn same_file_beats_same_dir() {
+        let mut table = SymbolTable::new();
+        table.insert("A.run".to_string(), nid(1), PathBuf::from("src/a.rs"));
+        table.insert("B.run".to_string(), nid(2), PathBuf::from("src/b.rs"));
+
+        // Both live in `src/`, so same-dir cannot disambiguate — same-file must.
+        assert_eq!(
+            table.resolve_ref("run", Path::new("src/a.rs")),
+            Resolution::SameFile(nid(1))
+        );
+    }
+
+    #[test]
+    fn colliding_fqn_keeps_both_definitions() {
+        let mut table = SymbolTable::new();
+        table.insert("process".to_string(), nid(1), PathBuf::from("src/utils.py"));
+        table.insert(
+            "process".to_string(),
+            nid(2),
+            PathBuf::from("src/helpers.py"),
+        );
+
+        // The old table overwrote here, orphaning one node entirely.
+        assert_eq!(table.resolve_all("process"), vec![nid(2), nid(1)]);
+        assert_eq!(
+            table.resolve("process"),
+            None,
+            "collision is not unambiguous"
+        );
+
+        let r = table.resolve_ref("process", Path::new("src/other.py"));
+        assert_eq!(r, Resolution::Ambiguous(vec![nid(2), nid(1)]));
+    }
+
+    #[test]
+    fn duplicate_insert_is_idempotent() {
+        let mut table = SymbolTable::new();
+        table.insert("a.b".to_string(), nid(1), PathBuf::from("x.rs"));
+        table.insert("a.b".to_string(), nid(1), PathBuf::from("x.rs"));
+
+        assert_eq!(table.resolve_all("a.b"), vec![nid(1)]);
+        assert_eq!(
+            table
+                .get_file_exports(&PathBuf::from("x.rs"))
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn resolution_confidence_is_ordered() {
+        assert!(Resolution::Exact(nid(0)).confidence() > Resolution::SameFile(nid(0)).confidence());
+        assert!(
+            Resolution::SameFile(nid(0)).confidence()
+                > Resolution::UniqueSuffix(nid(0)).confidence()
+        );
+        assert!(
+            Resolution::UniqueSuffix(nid(0)).confidence()
+                > Resolution::SameDir(nid(0)).confidence()
+        );
+        assert!(
+            Resolution::SameDir(nid(0)).confidence() > Resolution::Ambiguous(vec![]).confidence()
+        );
+        assert_eq!(Resolution::Unresolved.confidence(), 0.0);
+    }
+
+    #[test]
+    fn resolution_is_order_independent() {
+        // Same definitions inserted in opposite orders must resolve identically.
+        let mut a = SymbolTable::new();
+        a.insert("p.x.run".into(), nid(1), PathBuf::from("src/x/mod.rs"));
+        a.insert("p.y.run".into(), nid(2), PathBuf::from("src/y/mod.rs"));
+        a.insert("p.z.run".into(), nid(3), PathBuf::from("src/z/mod.rs"));
+
+        let mut b = SymbolTable::new();
+        b.insert("p.z.run".into(), nid(3), PathBuf::from("src/z/mod.rs"));
+        b.insert("p.y.run".into(), nid(2), PathBuf::from("src/y/mod.rs"));
+        b.insert("p.x.run".into(), nid(1), PathBuf::from("src/x/mod.rs"));
+
+        let ctx = Path::new("src/other/caller.rs");
+        assert_eq!(a.resolve_ref("run", ctx), b.resolve_ref("run", ctx));
+    }
+
+    #[test]
+    fn segment_suffixes_shapes() {
+        assert_eq!(segment_suffixes("a.b.c"), vec!["a.b.c", "b.c", "c"]);
+        assert_eq!(segment_suffixes("a::b::c"), vec!["a::b::c", "b::c", "c"]);
+        assert_eq!(segment_suffixes("solo"), vec!["solo"]);
+    }
+
+    #[test]
+    fn unicode_fqn_does_not_panic() {
+        let mut table = SymbolTable::new();
+        table.insert("módulo.función".to_string(), nid(1), PathBuf::from("a.py"));
+        assert_eq!(
+            table.resolve_ref("función", Path::new("b.py")),
+            Resolution::UniqueSuffix(nid(1))
+        );
     }
 }

@@ -97,20 +97,18 @@ fn extract_from_node(
                 }
             }
 
-            "export_statement" => {
-                for i in 0..node.child_count() {
-                    if let Some(child) = node.child(i) {
-                        let child_kind = child.kind();
-                        if matches!(
-                            child_kind,
-                            "function_declaration" | "class_declaration" | "lexical_declaration"
-                        ) {
-                            extract_from_node(&child, source, file_path, nodes, parent_name);
-                        }
-                    }
-                }
-            }
-
+            // `export_statement` is deliberately not handled here.
+            //
+            // It used to recurse into its declaration children explicitly, and
+            // then the generic child loop below recursed into those same
+            // children again — so every exported symbol was extracted twice.
+            // That doubled the node count for the export-heavy files typical of
+            // TS/JS, split each symbol's centrality across its duplicate, and
+            // double-counted it in blast radius. Two vertices also shared one
+            // `CodeNode::id`, since the id is a hash of (file, name, kind).
+            //
+            // The generic recursion already reaches every declaration, and
+            // `is_node_exported` reads the parent, so export status survives.
             _ => {}
         }
 
@@ -451,12 +449,23 @@ fn build_arrow_signature(node: &Node, source: &str, name: &str) -> String {
 /// ASTs (e.g. TypeScript compiler, large generated files).
 ///
 /// Resolution strategy:
-///   - Direct call   `foo()`         → "foo"         (resolvable via symbol table)
-///   - this-call     `this.foo()`    → "foo"          (resolvable via same-class lookup)
-///   - super-call    `super.foo()`   → "foo"          (resolvable via parent class)
-///   - Other dotted  `arr.push()`    → DROPPED        (method on unknown object type;
-///     can't resolve without type inference,
-///     and would cause false name collisions)
+///   - Direct call     `foo()`             → `"foo"`
+///   - this/super      `this.foo()`        → `"foo"`
+///   - Static-looking  `MathUtils.add()`   → `"MathUtils.add"` (exact FQN candidate)
+///   - Instance call   `userService.get()` → `".get"` (unknown-receiver marker)
+///
+/// # Why unknown-receiver calls are emitted rather than dropped
+///
+/// These used to be discarded outright, on the grounds that resolving `obj` needs
+/// type inference we do not have. But `obj.method()` is the dominant call shape in
+/// real TypeScript and JavaScript, so dropping it left the graph nearly edgeless on
+/// the largest ecosystem Arbor supports — and an empty graph reports a blast radius
+/// of zero, which reads as "safe" rather than "unknown".
+///
+/// The leading `.` marks the reference as receiver-unknown. The graph builder
+/// resolves it by method name, refuses to link when too many symbols share that
+/// name, and stamps a reduced confidence on whatever edge it does create. Precision
+/// is now expressed in the edge weight instead of by silence.
 fn extract_call_references(root: &Node, source: &str) -> Vec<String> {
     let mut refs = Vec::new();
     let mut cursor = root.walk();
@@ -468,22 +477,9 @@ fn extract_call_references(root: &Node, source: &str) -> Vec<String> {
             if let Some(func_node) = node.child_by_field_name("function") {
                 let range = func_node.byte_range();
                 if range.end <= source.len() {
-                    let call_text = &source[range];
-
-                    if !call_text.contains('.') {
-                        // Direct call: validate(x), clone(node) — always track
-                        refs.push(call_text.to_string());
-                    } else if call_text.starts_with("this.") || call_text.starts_with("super.") {
-                        // this.validate() / super.clone() — strip prefix, track method name
-                        if let Some(method) = call_text.split_once('.').map(|x| x.1) {
-                            if !method.is_empty() && !method.contains('.') {
-                                refs.push(method.to_string());
-                            }
-                        }
+                    if let Some(reference) = classify_callee(&source[range]) {
+                        refs.push(reference);
                     }
-                    // All other dotted calls (arr.push, path.resolve, str.trim, obj.method)
-                    // are DROPPED. Without type inference we cannot know what type `arr`,
-                    // `path`, `str`, or `obj` are, so any edge would be a false positive.
                 }
             }
         }
@@ -514,6 +510,64 @@ fn extract_call_references(root: &Node, source: &str) -> Vec<String> {
     refs
 }
 
+/// Turns the callee text of a call expression into a resolvable reference.
+///
+/// Returns `None` when the callee carries no usable name (an immediately-invoked
+/// function, a computed member like `handlers[key]`, or an empty match).
+fn classify_callee(raw: &str) -> Option<String> {
+    // Optional chaining is a null-guard, not a different call target.
+    let call_text = raw.replace("?.", ".");
+    let call_text = call_text.trim();
+
+    if call_text.is_empty() {
+        return None;
+    }
+
+    if !call_text.contains('.') {
+        // Direct call: `validate(x)`, `clone(node)`.
+        return if is_plain_identifier(call_text) {
+            Some(call_text.to_string())
+        } else {
+            // `(() => {})`, `arr[i]`, `(await f())` — no stable name.
+            None
+        };
+    }
+
+    let (receiver, method) = call_text.rsplit_once('.')?;
+    if !is_plain_identifier(method) {
+        return None;
+    }
+
+    if receiver == "this" || receiver == "super" {
+        // Resolvable against the enclosing class by bare method name.
+        return Some(method.to_string());
+    }
+
+    // A chained or computed receiver (`this.repo`, `getUser().profile`,
+    // `items[0]`) tells us nothing about the type, so fall through to the
+    // unknown-receiver marker.
+    if is_plain_identifier(receiver) {
+        // Capitalised bare receivers are classes, enums, or namespace imports
+        // in every mainstream TS/JS convention: `Logger.info`, `MathUtils.add`.
+        // Emitting the qualified name lets the symbol table match it exactly.
+        if receiver.starts_with(|c: char| c.is_uppercase()) {
+            return Some(format!("{receiver}.{method}"));
+        }
+    }
+
+    Some(format!(".{method}"))
+}
+
+/// Whether a string is a single JS/TS identifier (no operators, calls, or indexing).
+fn is_plain_identifier(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .next()
+            .is_some_and(|c| c.is_alphabetic() || c == '_' || c == '$')
+        && s.chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+}
+
 // Builder pattern helpers as a trait extension
 trait CodeNodeExt {
     fn with_async_if(self, cond: bool) -> Self;
@@ -542,5 +596,79 @@ impl CodeNodeExt for CodeNode {
         } else {
             self
         }
+    }
+}
+
+#[cfg(test)]
+mod callee_tests {
+    use super::classify_callee;
+
+    #[test]
+    fn direct_call_is_bare_name() {
+        assert_eq!(classify_callee("validate"), Some("validate".into()));
+        assert_eq!(classify_callee("_private"), Some("_private".into()));
+        assert_eq!(classify_callee("$jq"), Some("$jq".into()));
+    }
+
+    #[test]
+    fn this_and_super_strip_to_method() {
+        assert_eq!(classify_callee("this.validate"), Some("validate".into()));
+        assert_eq!(classify_callee("super.clone"), Some("clone".into()));
+    }
+
+    #[test]
+    fn capitalised_receiver_keeps_qualifier() {
+        // Resolvable as an exact FQN against a class or namespace import.
+        assert_eq!(
+            classify_callee("MathUtils.add"),
+            Some("MathUtils.add".into())
+        );
+        assert_eq!(classify_callee("Logger.info"), Some("Logger.info".into()));
+    }
+
+    #[test]
+    fn lowercase_receiver_becomes_unknown_marker() {
+        // The shape that used to be dropped entirely, and which dominates real
+        // TS/JS: service objects, imported instances, arrays, strings.
+        assert_eq!(
+            classify_callee("userService.findOne"),
+            Some(".findOne".into())
+        );
+        assert_eq!(classify_callee("arr.push"), Some(".push".into()));
+        assert_eq!(classify_callee("str.trim"), Some(".trim".into()));
+    }
+
+    #[test]
+    fn chained_receiver_becomes_unknown_marker() {
+        assert_eq!(
+            classify_callee("this.repo.findOne"),
+            Some(".findOne".into())
+        );
+        assert_eq!(classify_callee("a.b.c.d"), Some(".d".into()));
+        // The receiver is a call result, but `profile` is still the method
+        // being invoked and is worth resolving by name.
+        assert_eq!(
+            classify_callee("getUser().profile"),
+            Some(".profile".into())
+        );
+    }
+
+    #[test]
+    fn optional_chaining_is_normalised() {
+        assert_eq!(classify_callee("user?.getName"), Some(".getName".into()));
+        assert_eq!(classify_callee("this?.validate"), Some("validate".into()));
+    }
+
+    #[test]
+    fn computed_and_anonymous_callees_are_dropped() {
+        // No stable name to resolve against.
+        assert_eq!(classify_callee("handlers[key]"), None);
+        assert_eq!(classify_callee("(() => {})"), None);
+        assert_eq!(classify_callee(""), None);
+    }
+
+    #[test]
+    fn trailing_dot_is_not_a_method() {
+        assert_eq!(classify_callee("obj."), None);
     }
 }

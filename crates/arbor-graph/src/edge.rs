@@ -57,6 +57,14 @@ impl std::fmt::Display for EdgeKind {
     }
 }
 
+/// Confidence assumed for edges that predate confidence tracking.
+///
+/// Graphs cached by an older build deserialize without the field; treating
+/// them as certain preserves their previous behaviour exactly.
+fn default_confidence() -> f32 {
+    1.0
+}
+
 /// An edge in the code graph with location info.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Edge {
@@ -68,15 +76,28 @@ pub struct Edge {
 
     /// Line number where this edge originates.
     pub line: Option<u32>,
+
+    /// How sure we are this edge is real, in `[0.0, 1.0]`.
+    ///
+    /// An exact fully-qualified match is `1.0`. A bare name matched only by
+    /// same-directory locality is far weaker, and an ambiguous match weaker
+    /// still. Consumers that need certainty should filter on this rather than
+    /// treating every edge as proven — see [`Edge::is_confident`].
+    #[serde(default = "default_confidence")]
+    pub confidence: f32,
 }
 
 impl Edge {
-    /// Creates a new edge.
+    /// Edges at or above this confidence are treated as established fact.
+    pub const CONFIDENT_THRESHOLD: f32 = 0.75;
+
+    /// Creates a new edge with full confidence.
     pub fn new(kind: EdgeKind) -> Self {
         Self {
             kind,
             file: None,
             line: None,
+            confidence: 1.0,
         }
     }
 
@@ -86,7 +107,19 @@ impl Edge {
             kind,
             file: Some(file.into()),
             line: Some(line),
+            confidence: 1.0,
         }
+    }
+
+    /// Sets the confidence, clamped to `[0.0, 1.0]`.
+    pub fn with_confidence(mut self, confidence: f32) -> Self {
+        self.confidence = confidence.clamp(0.0, 1.0);
+        self
+    }
+
+    /// Whether this edge is strong enough to treat as certain.
+    pub fn is_confident(&self) -> bool {
+        self.confidence >= Self::CONFIDENT_THRESHOLD
     }
 }
 

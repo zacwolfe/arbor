@@ -32,8 +32,12 @@ pub struct ArborGraph {
     /// Maps file paths to node IDs (for incremental updates).
     file_index: HashMap<String, Vec<NodeId>>,
 
-    /// Centrality scores for ranking.
+    /// Percentile-rank centrality, comparable across repositories.
     centrality: HashMap<NodeId, f64>,
+
+    /// Raw PageRank mass, kept so a recompute can warm-start from it.
+    #[serde(default)]
+    centrality_raw: HashMap<NodeId, f64>,
 
     /// Search index for fast substring queries.
     #[serde(skip)]
@@ -55,6 +59,7 @@ impl ArborGraph {
             name_index: HashMap::new(),
             file_index: HashMap::new(),
             centrality: HashMap::new(),
+            centrality_raw: HashMap::new(),
             search_index: SearchIndex::new(),
         }
     }
@@ -66,6 +71,7 @@ impl ArborGraph {
         for index in self.graph.node_indices() {
             if let Some(node) = self.graph.node_weight(index) {
                 self.search_index.insert(&node.name, index);
+                index_node_documentation(&mut self.search_index, node, index);
             }
         }
     }
@@ -85,6 +91,9 @@ impl ArborGraph {
         self.name_index.entry(name.clone()).or_default().push(index);
         self.file_index.entry(file).or_default().push(index);
         self.search_index.insert(&name, index);
+        if let Some(node) = self.graph.node_weight(index) {
+            index_node_documentation(&mut self.search_index, node, index);
+        }
 
         index
     }
@@ -131,15 +140,36 @@ impl ArborGraph {
             .unwrap_or_default()
     }
 
-    /// Searches for nodes whose name contains the query.
+    /// Searches for nodes whose name literally contains the query.
     ///
-    /// Uses the search index for fast O(k) lookups where k is the number of matches,
-    /// instead of O(n) linear scan over all nodes.
+    /// Substring matching only: `search("login")` will not find
+    /// `get_authenticated`. Use [`search_ranked`](Self::search_ranked) when the
+    /// caller is asking about a concept rather than spelling a name.
     pub fn search(&self, query: &str) -> Vec<&CodeNode> {
         self.search_index
             .search(query)
             .iter()
             .filter_map(|id| self.graph.node_weight(*id))
+            .collect()
+    }
+
+    /// Searches names, identifier tokens, related concepts, and documentation.
+    ///
+    /// Returns hits ordered strongest-first, each labelled with *how* it
+    /// matched — so a caller can present an exact hit and a concept guess
+    /// differently instead of blending them into one opaque ranking.
+    ///
+    /// ```ignore
+    /// // Finds `get_authenticated`, `verifyJwt`, `hashPassword`, …
+    /// for (node, hit) in graph.search_ranked("login") {
+    ///     println!("{} ({})", node.name, hit.kind.label());
+    /// }
+    /// ```
+    pub fn search_ranked(&self, query: &str) -> Vec<(&CodeNode, crate::search_index::SearchHit)> {
+        self.search_index
+            .search_ranked(query)
+            .into_iter()
+            .filter_map(|hit| self.graph.node_weight(hit.id).map(|node| (node, hit)))
             .collect()
     }
 
@@ -226,19 +256,65 @@ impl ArborGraph {
         }
     }
 
-    /// Gets the centrality score for a node.
+    /// Centrality as a percentile rank in `[0.0, 1.0]`.
+    ///
+    /// `0.9` means "more central than 90% of the nodes in this repository",
+    /// and carries that meaning in every repository — so a threshold written
+    /// against it behaves the same on a god-object monolith and a flat service.
+    /// For the underlying PageRank mass see [`centrality_raw`](Self::centrality_raw).
     pub fn centrality(&self, index: NodeId) -> f64 {
         self.centrality.get(&index).copied().unwrap_or(0.0)
     }
 
-    /// Sets centrality scores (called after computation).
+    /// Raw PageRank mass for a node. Sums to ~1.0 across the graph.
+    pub fn centrality_raw(&self, index: NodeId) -> f64 {
+        self.centrality_raw.get(&index).copied().unwrap_or(0.0)
+    }
+
+    /// Iterates every edge weight, for density and confidence reporting.
+    pub fn edge_weights(&self) -> impl Iterator<Item = &Edge> {
+        self.graph.edge_weights()
+    }
+
+    /// Counts edges at or above [`Edge::CONFIDENT_THRESHOLD`].
+    ///
+    /// The gap between this and [`edge_count`](Self::edge_count) is how much of
+    /// the graph rests on inference rather than proof — worth surfacing in any
+    /// report that claims to describe what a change reaches.
+    pub fn confident_edge_count(&self) -> usize {
+        self.graph
+            .edge_weights()
+            .filter(|edge| edge.is_confident())
+            .count()
+    }
+
+    /// Sets percentile centrality scores.
+    ///
+    /// Prefer [`set_centrality_scores`](Self::set_centrality_scores), which
+    /// also stores the raw scores a warm start needs.
     pub fn set_centrality(&mut self, scores: HashMap<NodeId, f64>) {
         self.centrality = scores;
     }
 
-    /// Returns the full centrality score map (e.g. to warm-start a recompute).
+    /// Stores both the raw and percentile forms from a computation.
+    pub fn set_centrality_scores(&mut self, scores: crate::ranking::CentralityScores) {
+        let (raw, percentile) = scores.into_parts();
+        self.centrality_raw = raw;
+        self.centrality = percentile;
+    }
+
+    /// Raw score map, for warm-starting a recompute.
+    ///
+    /// Falls back to the percentile map when raw scores are absent — a graph
+    /// deserialized from a cache written before raw scores were stored. The
+    /// warm-start rescale in [`crate::ranking`] tolerates any scalar multiple
+    /// of the fixed point, so this degrades convergence speed, not correctness.
     pub fn centrality_map(&self) -> &HashMap<NodeId, f64> {
-        &self.centrality
+        if self.centrality_raw.is_empty() {
+            &self.centrality
+        } else {
+            &self.centrality_raw
+        }
     }
 
     /// Returns the number of nodes.
@@ -620,15 +696,7 @@ mod new_query_tests {
         let a = g.add_node(make_node("foo", NodeKind::Function, "src/a.rs"));
         let b = g.add_node(make_node("bar", NodeKind::Function, "src/a.rs"));
         let _c = g.add_node(make_node("baz", NodeKind::Function, "src/b.rs"));
-        g.add_edge(
-            a,
-            b,
-            Edge {
-                kind: EdgeKind::Calls,
-                file: None,
-                line: None,
-            },
-        );
+        g.add_edge(a, b, Edge::new(EdgeKind::Calls));
         let (nodes, edges) = g.nodes_in_file_with_edges("src/a.rs");
         assert_eq!(nodes.len(), 2);
         assert_eq!(edges.len(), 1);
@@ -643,17 +711,29 @@ mod new_query_tests {
         let a = g.add_node(make_node("foo", NodeKind::Function, "src/a.rs"));
         let c = g.add_node(make_node("baz", NodeKind::Function, "src/b.rs"));
         // Edge from a.rs to b.rs — should NOT appear in get_file_graph for a.rs
-        g.add_edge(
-            a,
-            c,
-            Edge {
-                kind: EdgeKind::Calls,
-                file: None,
-                line: None,
-            },
-        );
+        g.add_edge(a, c, Edge::new(EdgeKind::Calls));
         let (nodes, edges) = g.nodes_in_file_with_edges("src/a.rs");
         assert_eq!(nodes.len(), 1); // only foo
         assert_eq!(edges.len(), 0); // cross-file edge excluded
+    }
+}
+
+/// Feeds a node's supporting text into the search index.
+///
+/// Docstrings, signatures, and qualified names are already parsed into every
+/// `CodeNode` and were previously ignored at search time — so a function
+/// documented as "validates the user's login credentials" was unreachable by a
+/// search for "login". The file path is included too: `src/auth/session.ts`
+/// says as much about a symbol as its name often does.
+fn index_node_documentation(index: &mut SearchIndex, node: &CodeNode, id: NodeId) {
+    if let Some(doc) = &node.docstring {
+        index.insert_documentation(doc, id);
+    }
+    if let Some(sig) = &node.signature {
+        index.insert_documentation(sig, id);
+    }
+    index.insert_documentation(&node.file, id);
+    if node.qualified_name != node.name {
+        index.insert_documentation(&node.qualified_name, id);
     }
 }

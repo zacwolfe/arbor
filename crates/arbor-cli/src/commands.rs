@@ -1349,7 +1349,7 @@ pub async fn serve(port: u16, headless: bool, path: &Path, follow_symlinks: bool
 
     // Compute centrality
     let scores = compute_centrality(&graph, 20, 0.85);
-    graph.set_centrality(scores.into_map());
+    graph.set_centrality_scores(scores);
 
     println!(
         "{} Indexed {} files ({} nodes)",
@@ -1390,7 +1390,7 @@ pub async fn viz(path: &Path, follow_symlinks: bool) -> Result<()> {
     // Compute centrality for better initial layout
     println!("Computing centrality...");
     let scores = compute_centrality(&graph, 20, 0.85);
-    graph.set_centrality(scores.into_map());
+    graph.set_centrality_scores(scores);
 
     println!(
         "{} Indexed {} files ({} nodes)",
@@ -1669,7 +1669,7 @@ pub async fn bridge(
                 *guard = index_result.graph;
 
                 let scores = compute_centrality(&guard, 20, 0.85);
-                guard.set_centrality(scores.into_map());
+                guard.set_centrality_scores(scores);
 
                 eprintln!(
                     "{} Index Ready: {} files, {} nodes",
@@ -3615,7 +3615,7 @@ pub fn map(
     if !has_centrality {
         eprintln!("Computing centrality...");
         let scores = compute_centrality(&graph, 20, 0.85);
-        graph.set_centrality(scores.into_map());
+        graph.set_centrality_scores(scores);
         let _ = save_graph_binary(&resolved_path, &graph);
     }
 
