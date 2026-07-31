@@ -38,6 +38,11 @@ pub fn node_matches_changed_file(node_file: &str, changed_file: &str, project_ro
 }
 
 /// Collect node IDs whose files appear in the changed-files list.
+///
+/// This is *file* granularity: every symbol in a touched file is treated as
+/// changed. For a one-line edit in a 60-symbol file that overstates the blast
+/// radius by roughly 60x. Prefer [`changed_node_ids_for_ranges`] whenever the
+/// caller has the diff hunks — which any PR-driven integration does.
 pub fn changed_node_ids(
     graph: &ArborGraph,
     changed_files: &[String],
@@ -53,6 +58,155 @@ pub fn changed_node_ids(
             })
         })
         .collect()
+}
+
+/// A contiguous run of changed lines within one file.
+///
+/// Lines are 1-indexed and both bounds are inclusive, matching how editors and
+/// `CodeNode::line_start`/`line_end` count.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangedRange {
+    pub file: String,
+    pub start_line: u32,
+    pub end_line: u32,
+}
+
+impl ChangedRange {
+    pub fn new(file: impl Into<String>, start_line: u32, end_line: u32) -> Self {
+        Self {
+            file: file.into(),
+            start_line,
+            end_line,
+        }
+    }
+
+    /// Whether this range overlaps an inclusive `[start, end]` span.
+    fn overlaps(&self, start: u32, end: u32) -> bool {
+        self.start_line <= end && start <= self.end_line
+    }
+}
+
+/// Symbols touched by a set of changed line ranges.
+#[derive(Debug, Clone, Default)]
+pub struct ChangedSymbols {
+    /// Nodes overlapping at least one changed range, in graph order.
+    pub node_ids: Vec<NodeId>,
+
+    /// Files that changed but where no symbol overlapped the changed lines.
+    ///
+    /// Usually an import block, a top-level constant, a comment, or a
+    /// whitespace-only edit. Surfacing these lets a report say "this file
+    /// changed outside any tracked symbol" instead of silently reporting
+    /// zero impact — an honest unknown rather than an invisible one.
+    pub files_without_symbol_hits: Vec<String>,
+}
+
+/// Collect node IDs whose line spans overlap the given changed ranges.
+///
+/// A symbol counts as changed when any changed line falls inside its span.
+/// Symbols elsewhere in the same file are left out, which is the whole point:
+/// editing one function should not implicate its 59 neighbours.
+///
+/// Nodes whose line span is unset (`line_end == 0`, which some fallback
+/// parsers produce) cannot be positioned, so they are included whenever their
+/// file is touched. That is the conservative choice — better a slightly wide
+/// radius than a silently missing symbol.
+pub fn changed_node_ids_for_ranges(
+    graph: &ArborGraph,
+    ranges: &[ChangedRange],
+    project_root: &Path,
+) -> ChangedSymbols {
+    let mut node_ids = Vec::new();
+    let mut files_hit: HashSet<String> = HashSet::new();
+
+    for idx in graph.node_indexes() {
+        let Some(node) = graph.get(idx) else {
+            continue;
+        };
+
+        for range in ranges {
+            if !node_matches_changed_file(&node.file, &range.file, project_root) {
+                continue;
+            }
+
+            // Position-unknown nodes fall back to file granularity.
+            let positioned = node.line_end > 0;
+            if !positioned || range.overlaps(node.line_start, node.line_end) {
+                node_ids.push(idx);
+                files_hit.insert(range.file.clone());
+                break;
+            }
+        }
+    }
+
+    let mut files_without_symbol_hits: Vec<String> = ranges
+        .iter()
+        .map(|r| r.file.clone())
+        .filter(|f| !files_hit.contains(f))
+        .collect();
+    files_without_symbol_hits.sort();
+    files_without_symbol_hits.dedup();
+
+    ChangedSymbols {
+        node_ids,
+        files_without_symbol_hits,
+    }
+}
+
+/// Extract changed line ranges from a unified diff patch for one file.
+///
+/// Reads the `+` side of each `@@ -a,b +c,d @@` header, so the ranges refer to
+/// line numbers in the *new* file — the same numbering the indexed graph uses.
+///
+/// The full hunk span is returned, including its context lines. Context is
+/// deliberately kept: a hunk that only deletes lines has no added lines to
+/// point at, but the deletion still changes the enclosing symbol, and the
+/// surrounding context is what locates it. Over-including by the three context
+/// lines either side is immaterial next to the alternative of taking the whole
+/// file.
+///
+/// Malformed headers are skipped rather than failing the parse — a diff that
+/// partially parses still yields a far better radius than no ranges at all.
+pub fn parse_unified_diff_ranges(patch: &str, file: &str) -> Vec<ChangedRange> {
+    let mut ranges = Vec::new();
+
+    for line in patch.lines() {
+        if !line.starts_with("@@") {
+            continue;
+        }
+
+        // `@@ -12,7 +12,9 @@ fn context()` → we want the `+12,9`.
+        let Some(rest) = line.strip_prefix("@@") else {
+            continue;
+        };
+        let Some(plus) = rest.split('+').nth(1) else {
+            continue;
+        };
+        let spec = plus.split_whitespace().next().unwrap_or("");
+        let mut parts = spec.split(',');
+
+        let Some(Ok(start)) = parts.next().map(str::parse::<u32>) else {
+            continue;
+        };
+        // An omitted count means a single line.
+        let count = match parts.next() {
+            Some(c) => match c.parse::<u32>() {
+                Ok(n) => n,
+                Err(_) => continue,
+            },
+            None => 1,
+        };
+
+        if count == 0 {
+            // Pure deletion: the new file has no lines here. Anchor on the
+            // insertion point so the enclosing symbol is still found.
+            ranges.push(ChangedRange::new(file, start.max(1), start.max(1)));
+        } else {
+            ranges.push(ChangedRange::new(file, start, start + count - 1));
+        }
+    }
+
+    ranges
 }
 
 fn risk_level_for(blast_radius_nodes: usize) -> String {
@@ -215,5 +369,174 @@ mod tests {
         let ids = changed_node_ids(&graph, &["src/lib.rs".to_string()], Path::new("."));
         assert_eq!(ids.len(), 1);
         assert_eq!(ids[0], id);
+    }
+
+    /// A 3-symbol file: `a` on 1-10, `b` on 20-30, `c` on 40-50.
+    fn three_symbol_file() -> (ArborGraph, NodeId, NodeId, NodeId) {
+        let mut graph = ArborGraph::new();
+        let a = graph
+            .add_node(CodeNode::new("a", "a", NodeKind::Function, "src/lib.rs").with_lines(1, 10));
+        let b = graph
+            .add_node(CodeNode::new("b", "b", NodeKind::Function, "src/lib.rs").with_lines(20, 30));
+        let c = graph
+            .add_node(CodeNode::new("c", "c", NodeKind::Function, "src/lib.rs").with_lines(40, 50));
+        (graph, a, b, c)
+    }
+
+    #[test]
+    fn ranges_select_only_the_edited_symbol() {
+        let (graph, _a, b, _c) = three_symbol_file();
+        let ranges = vec![ChangedRange::new("src/lib.rs", 22, 23)];
+
+        let changed = changed_node_ids_for_ranges(&graph, &ranges, Path::new("."));
+        assert_eq!(
+            changed.node_ids,
+            vec![b],
+            "editing inside b must not implicate a or c"
+        );
+        assert!(changed.files_without_symbol_hits.is_empty());
+    }
+
+    #[test]
+    fn file_granularity_overstates_by_the_symbol_count() {
+        // The regression this whole API exists to prevent.
+        let (graph, _, _, _) = three_symbol_file();
+        let by_file = changed_node_ids(&graph, &["src/lib.rs".to_string()], Path::new("."));
+        let by_range = changed_node_ids_for_ranges(
+            &graph,
+            &[ChangedRange::new("src/lib.rs", 22, 23)],
+            Path::new("."),
+        );
+
+        assert_eq!(by_file.len(), 3);
+        assert_eq!(by_range.node_ids.len(), 1);
+    }
+
+    #[test]
+    fn range_spanning_two_symbols_selects_both() {
+        let (graph, _a, b, c) = three_symbol_file();
+        let ranges = vec![ChangedRange::new("src/lib.rs", 25, 45)];
+
+        let changed = changed_node_ids_for_ranges(&graph, &ranges, Path::new("."));
+        assert_eq!(changed.node_ids, vec![b, c]);
+    }
+
+    #[test]
+    fn boundary_lines_count_as_overlap() {
+        let (graph, a, _b, _c) = three_symbol_file();
+
+        // Touching exactly the first and last line of `a`.
+        for line in [1u32, 10u32] {
+            let changed = changed_node_ids_for_ranges(
+                &graph,
+                &[ChangedRange::new("src/lib.rs", line, line)],
+                Path::new("."),
+            );
+            assert_eq!(changed.node_ids, vec![a], "line {line} should hit a");
+        }
+    }
+
+    #[test]
+    fn change_between_symbols_reports_no_symbol_hit() {
+        let (graph, _, _, _) = three_symbol_file();
+        // Line 15 sits in the gap between `a` and `b` — an import or comment.
+        let changed = changed_node_ids_for_ranges(
+            &graph,
+            &[ChangedRange::new("src/lib.rs", 15, 15)],
+            Path::new("."),
+        );
+
+        assert!(changed.node_ids.is_empty());
+        assert_eq!(
+            changed.files_without_symbol_hits,
+            vec!["src/lib.rs".to_string()],
+            "unmatched changes must be surfaced, not silently dropped"
+        );
+    }
+
+    #[test]
+    fn unpositioned_nodes_fall_back_to_file_granularity() {
+        let mut graph = ArborGraph::new();
+        // line_end == 0: some fallback parsers do not record positions.
+        let id = graph.add_node(CodeNode::new("x", "x", NodeKind::Function, "src/lib.rs"));
+
+        let changed = changed_node_ids_for_ranges(
+            &graph,
+            &[ChangedRange::new("src/lib.rs", 999, 999)],
+            Path::new("."),
+        );
+        assert_eq!(changed.node_ids, vec![id]);
+    }
+
+    #[test]
+    fn ranges_in_other_files_are_ignored() {
+        let (graph, _a, _b, _c) = three_symbol_file();
+        let changed = changed_node_ids_for_ranges(
+            &graph,
+            &[ChangedRange::new("src/other.rs", 1, 100)],
+            Path::new("."),
+        );
+        assert!(changed.node_ids.is_empty());
+        assert_eq!(changed.files_without_symbol_hits, vec!["src/other.rs"]);
+    }
+
+    #[test]
+    fn parses_standard_hunk_headers() {
+        let patch = "\
+@@ -12,7 +12,9 @@ fn context()
+-old
++new
+@@ -40,3 +42,3 @@
+ ctx";
+        let ranges = parse_unified_diff_ranges(patch, "src/lib.rs");
+        assert_eq!(
+            ranges,
+            vec![
+                ChangedRange::new("src/lib.rs", 12, 20),
+                ChangedRange::new("src/lib.rs", 42, 44),
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_hunk_header_with_omitted_count() {
+        // `+5` with no comma means exactly one line.
+        let ranges = parse_unified_diff_ranges("@@ -5 +5 @@\n+x", "a.rs");
+        assert_eq!(ranges, vec![ChangedRange::new("a.rs", 5, 5)]);
+    }
+
+    #[test]
+    fn pure_deletion_anchors_on_insertion_point() {
+        // `+7,0`: the new file has no lines here, but the deletion still
+        // changes whatever symbol surrounds line 7.
+        let ranges = parse_unified_diff_ranges("@@ -7,3 +7,0 @@", "a.rs");
+        assert_eq!(ranges, vec![ChangedRange::new("a.rs", 7, 7)]);
+    }
+
+    #[test]
+    fn malformed_headers_are_skipped_not_fatal() {
+        let patch = "\
+@@ garbage @@
+@@ -1,2 +1,2 @@
++ok
+@@ -x,y +z,w @@";
+        let ranges = parse_unified_diff_ranges(patch, "a.rs");
+        assert_eq!(ranges, vec![ChangedRange::new("a.rs", 1, 2)]);
+    }
+
+    #[test]
+    fn empty_patch_yields_no_ranges() {
+        assert!(parse_unified_diff_ranges("", "a.rs").is_empty());
+        assert!(parse_unified_diff_ranges("no hunks here", "a.rs").is_empty());
+    }
+
+    #[test]
+    fn end_to_end_patch_to_symbols() {
+        let (graph, _a, b, _c) = three_symbol_file();
+        // A hunk covering lines 21-24 — inside `b` only.
+        let patch = "@@ -21,4 +21,4 @@\n-old\n+new";
+        let ranges = parse_unified_diff_ranges(patch, "src/lib.rs");
+        let changed = changed_node_ids_for_ranges(&graph, &ranges, Path::new("."));
+        assert_eq!(changed.node_ids, vec![b]);
     }
 }

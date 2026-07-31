@@ -47,7 +47,8 @@ pub use search_index::SearchIndex;
 pub use builder::GraphBuilder;
 pub use confidence::{ConfidenceExplanation, ConfidenceLevel, NodeRole};
 pub use diff::{
-    changed_node_ids, compute_blast_radius, node_matches_changed_file, BlastRadiusSummary,
+    changed_node_ids, changed_node_ids_for_ranges, compute_blast_radius, node_matches_changed_file,
+    parse_unified_diff_ranges, BlastRadiusSummary, ChangedRange, ChangedSymbols,
 };
 pub use edge::{Edge, EdgeKind, GraphEdge};
 pub use graph::{ArborGraph, NodeId};
