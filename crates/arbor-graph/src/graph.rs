@@ -71,6 +71,7 @@ impl ArborGraph {
         for index in self.graph.node_indices() {
             if let Some(node) = self.graph.node_weight(index) {
                 self.search_index.insert(&node.name, index);
+                index_node_documentation(&mut self.search_index, node, index);
             }
         }
     }
@@ -90,6 +91,9 @@ impl ArborGraph {
         self.name_index.entry(name.clone()).or_default().push(index);
         self.file_index.entry(file).or_default().push(index);
         self.search_index.insert(&name, index);
+        if let Some(node) = self.graph.node_weight(index) {
+            index_node_documentation(&mut self.search_index, node, index);
+        }
 
         index
     }
@@ -136,14 +140,36 @@ impl ArborGraph {
             .unwrap_or_default()
     }
 
-    /// Searches for nodes whose name contains the query.
+    /// Searches for nodes whose name literally contains the query.
     ///
-    /// Uses the search index for fast lookups instead of scanning all nodes.
+    /// Substring matching only: `search("login")` will not find
+    /// `get_authenticated`. Use [`search_ranked`](Self::search_ranked) when the
+    /// caller is asking about a concept rather than spelling a name.
     pub fn search(&self, query: &str) -> Vec<&CodeNode> {
         self.search_index
             .search(query)
             .iter()
             .filter_map(|id| self.graph.node_weight(*id))
+            .collect()
+    }
+
+    /// Searches names, identifier tokens, related concepts, and documentation.
+    ///
+    /// Returns hits ordered strongest-first, each labelled with *how* it
+    /// matched — so a caller can present an exact hit and a concept guess
+    /// differently instead of blending them into one opaque ranking.
+    ///
+    /// ```ignore
+    /// // Finds `get_authenticated`, `verifyJwt`, `hashPassword`, …
+    /// for (node, hit) in graph.search_ranked("login") {
+    ///     println!("{} ({})", node.name, hit.kind.label());
+    /// }
+    /// ```
+    pub fn search_ranked(&self, query: &str) -> Vec<(&CodeNode, crate::search_index::SearchHit)> {
+        self.search_index
+            .search_ranked(query)
+            .into_iter()
+            .filter_map(|hit| self.graph.node_weight(hit.id).map(|node| (node, hit)))
             .collect()
     }
 
@@ -692,3 +718,22 @@ mod new_query_tests {
     }
 }
 
+/// Feeds a node's supporting text into the search index.
+///
+/// Docstrings, signatures, and qualified names are already parsed into every
+/// `CodeNode` and were previously ignored at search time — so a function
+/// documented as "validates the user's login credentials" was unreachable by a
+/// search for "login". The file path is included too: `src/auth/session.ts`
+/// says as much about a symbol as its name often does.
+fn index_node_documentation(index: &mut SearchIndex, node: &CodeNode, id: NodeId) {
+    if let Some(doc) = &node.docstring {
+        index.insert_documentation(doc, id);
+    }
+    if let Some(sig) = &node.signature {
+        index.insert_documentation(sig, id);
+    }
+    index.insert_documentation(&node.file, id);
+    if node.qualified_name != node.name {
+        index.insert_documentation(&node.qualified_name, id);
+    }
+}

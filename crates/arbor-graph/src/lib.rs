@@ -34,6 +34,7 @@ mod edge;
 mod graph;
 mod heuristics;
 mod impact;
+pub mod lexicon;
 mod query;
 mod ranking;
 mod search_index;
@@ -42,7 +43,7 @@ mod slice;
 pub mod store;
 pub mod symbol_table;
 
-pub use search_index::SearchIndex;
+pub use search_index::{MatchKind, SearchHit, SearchIndex};
 
 pub use builder::GraphBuilder;
 pub use confidence::{ConfidenceExplanation, ConfidenceLevel, NodeRole};
@@ -57,6 +58,7 @@ pub use heuristics::{
     UncertainEdgeKind,
 };
 pub use impact::{AffectedNode, ImpactAnalysis, ImpactDirection, ImpactSeverity};
+pub use lexicon::{stem, tokenize_identifier, Lexicon};
 pub use query::{DependentInfo, ImpactResult, NodeInfo, QueryResult};
 pub use ranking::{compute_centrality, compute_centrality_warm, CentralityScores};
 pub use slice::{ContextNode, ContextSlice, TruncationReason};
