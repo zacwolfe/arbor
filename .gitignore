@@ -101,3 +101,6 @@ lattice/
 
 # Local release scratch docs (never ship)
 docs/_*.md
+
+# Determinism-test fixtures are generated at test time.
+crates/arbor-watcher/tests/fixtures/
