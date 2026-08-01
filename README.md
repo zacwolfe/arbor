@@ -25,7 +25,7 @@
   <sub>Simulated replay — the <code>arbor</code> commands and their output are real (tokio @ 178k LOC). Methodology: <a href="docs/BENCHMARKS.md">BENCHMARKS.md</a></sub>
 </p>
 
-> **v2.5.0 — The Last Excuse** · PageRank **23x faster** (149.8ms → 6.6ms on a 10k-node graph). Indexing goes parallel across every core. A 178k-LOC codebase cold-indexes in **1.6s**. "Indexing is slow" was the last argument for letting your agent navigate with `grep -r` — it's gone. Every number reproducible: [BENCHMARKS.md](docs/BENCHMARKS.md) · [Release notes →](docs/RELEASE_NOTES_v2.5.0.md)
+> **v2.6.0 — Ground Truth** · The graph was wrong in ways v2.5.0 made fast. Colliding symbols were silently dropped, resolution depended on hash order, every edge claimed certainty, and every exported TypeScript symbol was indexed twice. All fixed, all tested. Edge recall **+14% on TypeScript**, **+44% on Rust**; **25% of a TS graph was phantom nodes**. Reproduce it yourself: `cargo run -p arbor-watcher --example graph_stats -- <dir>`
 
 ---
 
@@ -42,9 +42,39 @@ Most AI coding tools treat code as text. Arbor builds a **semantic dependency gr
 
 No keyword guessing. No embedding hallucinations. One graph, every interface.
 
+Where the graph is *unsure*, it says so — edges carry a confidence, and ambiguous resolutions are labelled rather than hidden. An honest unknown beats a confident wrong answer.
+
 ---
 
-## What's new in v2.5.0
+## What's new in v2.6.0
+
+Correctness, not speed. Each of these was silently wrong before.
+
+| Fix | Why it mattered |
+|-----|-----------------|
+| **Colliding symbols are kept** | `SymbolTable` used `HashMap::insert`, so a second `handler`, `new`, or `process` replaced the first. The loser had zero callers and was invisible to blast radius. |
+| **Resolution is deterministic** | Same-directory locality was decided by iterating a `HashMap`. Rust seeds `RandomState` per process, so the same binary on the same input could build different edges between runs. Now asserted across eight fresh processes. |
+| **Edges carry confidence** | A proven same-file call and a same-directory guess were identical evidence. Each edge now scores `[0,1]` by how it resolved. |
+| **Exported TS symbols indexed once** | `export_statement` recursed into its children, then the generic loop recursed again — every exported symbol became two vertices sharing one node id. **133 phantom nodes on a 149-file app, 25% of the graph.** |
+| **Method calls on untyped receivers resolve** | `obj.method()` was dropped outright, leaving the graph nearly edgeless on TS/JS — and an empty graph reports a blast radius of zero, which reads as "safe" rather than "unknown". |
+| **Centrality is a percentile rank** | Scores were divided by the graph maximum, so the top node was `1.0` by construction and a `0.6` threshold meant nothing consistent between repos. Adding one hub rescaled every other node. |
+| **Resolution is O(1), not O(refs × nodes × files)** | Unresolvable references — stdlib and third-party calls, most call sites in real code — paid the worst case. Suffixes are now indexed. |
+
+**New capability — concept search.** Substring matching cannot find `get_authenticated` from `login`; they share no substring. Identifiers are now tokenized and expanded through curated concept clusters, and docstrings, signatures, and paths are indexed alongside names. Deterministic, offline, no model. Available on the library as `ArborGraph::search_ranked` (`arbor query` remains literal-substring for now).
+
+**New capability — hunk-level impact.** `changed_node_ids_for_ranges` keeps only symbols whose lines actually changed, instead of every symbol in a touched file.
+
+Measured on identical node sets, after the duplicate-extraction fix:
+
+| Codebase | Before | After |
+|----------|--------|-------|
+| TypeScript (149 files) | 172 edges | **196** (+14%) |
+| Rust (arbor-graph) | 116 edges | **167** (+44%) |
+
+Graph caches from earlier versions are invalidated — centrality now means something different, so a stale cache would be read wrong.
+
+<details>
+<summary><strong>v2.5.0 — The Last Excuse</strong> (PageRank 23x, parallel indexing, warm-start centrality)</summary>
 
 | Change | Measured |
 |--------|----------|
@@ -53,7 +83,9 @@ No keyword guessing. No embedding hallucinations. One graph, every interface.
 | **Warm-start centrality** — watcher recomputes seed from previous scores | Converges in ~2 rounds after a one-file patch instead of the full 20-iteration budget |
 | **Convergence early-exit** | Iteration stops at 1e-9 max delta — the budget is a ceiling, not a sentence |
 
-Zero breaking changes — `cargo install arbor-graph-cli --force` and everything is just faster. Think a number is wrong? `cargo bench -p arbor-graph` and prove it: [BENCHMARKS.md](docs/BENCHMARKS.md).
+Think a number is wrong? `cargo bench -p arbor-graph` and prove it: [BENCHMARKS.md](docs/BENCHMARKS.md).
+
+</details>
 
 <details>
 <summary><strong>v2.4.0 — The Agent-Native Leap</strong> (MCP <code>2026-07-28</code>, HTTP transport, Tasks, MCP Apps)</summary>
