@@ -3,7 +3,7 @@
 //! The ArborGraph wraps petgraph and adds indexes for fast lookups.
 //! It's the central data structure that everything else works with.
 
-use crate::edge::{Edge, EdgeKind, GraphEdge};
+use crate::edge::{Edge, EdgeKind, GraphEdge, PinnedEdge};
 use crate::search_index::SearchIndex;
 use arbor_core::CodeNode;
 use petgraph::stable_graph::{NodeIndex, StableDiGraph};
@@ -101,6 +101,37 @@ impl ArborGraph {
     /// Adds an edge between two nodes.
     pub fn add_edge(&mut self, from: NodeId, to: NodeId, edge: Edge) {
         self.graph.add_edge(from, to, edge);
+    }
+
+    /// Inserts edges whose endpoints are already resolved to node IDs.
+    ///
+    /// Returns the number dropped because an endpoint is not in the graph. A
+    /// non-zero count is normal for a compiler index — it references library
+    /// symbols that have no definition in this repository — but a count near
+    /// the total means the index and the node set disagree, so callers should
+    /// surface it rather than discard it.
+    pub fn add_pinned_edges(&mut self, edges: impl IntoIterator<Item = PinnedEdge>) -> usize {
+        let mut dropped = 0usize;
+
+        for pinned in edges {
+            let (Some(from), Some(to)) = (
+                self.get_index(&pinned.from_id),
+                self.get_index(&pinned.to_id),
+            ) else {
+                dropped += 1;
+                continue;
+            };
+
+            if from == to {
+                // Self-recursion adds no reachability information and skews
+                // centrality toward whatever happens to recurse.
+                continue;
+            }
+
+            self.add_edge(from, to, pinned.edge);
+        }
+
+        dropped
     }
 
     /// Gets a node by its string ID.

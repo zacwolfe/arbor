@@ -40,6 +40,8 @@ mod ranking;
 mod search_index;
 mod slice;
 
+pub mod cache;
+pub mod scip_task;
 pub mod store;
 pub mod symbol_table;
 
@@ -51,7 +53,7 @@ pub use diff::{
     changed_node_ids, changed_node_ids_for_ranges, compute_blast_radius, node_matches_changed_file,
     parse_unified_diff_ranges, BlastRadiusSummary, ChangedRange, ChangedSymbols,
 };
-pub use edge::{Edge, EdgeKind, GraphEdge};
+pub use edge::{Edge, EdgeKind, GraphEdge, PinnedEdge};
 pub use graph::{ArborGraph, NodeId};
 pub use heuristics::{
     detect_analysis_limitations, AnalysisWarning, HeuristicsMatcher, UncertainEdge,
@@ -61,6 +63,7 @@ pub use impact::{AffectedNode, ImpactAnalysis, ImpactDirection, ImpactSeverity};
 pub use lexicon::{stem, tokenize_identifier, Lexicon};
 pub use query::{DependentInfo, ImpactResult, NodeInfo, QueryResult};
 pub use ranking::{compute_centrality, compute_centrality_warm, CentralityScores};
+pub use scip_task::{ScipTask, ScipTaskStatus};
 pub use slice::{ContextNode, ContextSlice, TruncationReason};
 pub use store::{GraphStore, StoreError};
 pub use symbol_table::{Resolution, SymbolEntry, SymbolTable};

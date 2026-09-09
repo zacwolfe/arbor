@@ -123,6 +123,25 @@ impl Edge {
     }
 }
 
+/// An edge whose endpoints are already known exactly.
+///
+/// Tree-sitter gives us names and we guess which definition they mean. A
+/// compiler-backed indexer (see the `arbor-scip` crate) gives us the answer
+/// outright, so those edges must bypass name resolution entirely — running
+/// them through it would discard the one thing that makes them better than a
+/// guess.
+#[derive(Debug, Clone)]
+pub struct PinnedEdge {
+    /// [`arbor_core::CodeNode::id`] of the source node.
+    pub from_id: String,
+
+    /// [`arbor_core::CodeNode::id`] of the target node.
+    pub to_id: String,
+
+    /// The edge to insert, confidence included.
+    pub edge: Edge,
+}
+
 /// A simplified edge for graph export/visualization.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GraphEdge {

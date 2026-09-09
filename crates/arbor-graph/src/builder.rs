@@ -4,7 +4,7 @@
 //!   1. Add all nodes — populates symbol table and import map
 //!   2. Resolve edges — uses import context to create accurate edges
 
-use crate::edge::{Edge, EdgeKind};
+use crate::edge::{Edge, EdgeKind, PinnedEdge};
 use crate::graph::{ArborGraph, NodeId};
 use crate::symbol_table::SymbolTable;
 use arbor_core::{CodeNode, NodeKind};
@@ -29,6 +29,11 @@ pub struct GraphBuilder {
     graph: ArborGraph,
     symbol_table: SymbolTable,
     name_to_id: HashMap<String, String>,
+
+    /// Edges supplied with both endpoints already resolved. Applied after
+    /// [`GraphBuilder::resolve_edges`] so a pinned edge is never shadowed by
+    /// a guessed one for the same pair.
+    pinned_edges: Vec<PinnedEdge>,
 
     /// Per-file map of locally-bound name → source module specifier.
     /// Built from Import nodes that carry their imported names in `references`.
@@ -65,9 +70,19 @@ impl GraphBuilder {
             graph: ArborGraph::new(),
             symbol_table: SymbolTable::new(),
             name_to_id: HashMap::new(),
+            pinned_edges: Vec::new(),
             import_map: HashMap::new(),
             namespace_imports: HashMap::new(),
         }
+    }
+
+    /// Queues edges whose endpoints are already resolved exactly.
+    ///
+    /// Endpoints are [`CodeNode::id`] values, so the nodes they name must have
+    /// been handed to [`GraphBuilder::add_nodes`] as well — an edge pointing at
+    /// an absent node is dropped rather than inventing a placeholder vertex.
+    pub fn add_pinned_edges(&mut self, edges: impl IntoIterator<Item = PinnedEdge>) {
+        self.pinned_edges.extend(edges);
     }
 
     /// Adds nodes from a parsed file to the graph.
@@ -313,11 +328,18 @@ impl GraphBuilder {
     /// Finishes building and returns the graph.
     pub fn build(mut self) -> ArborGraph {
         self.resolve_edges();
+        let pinned = std::mem::take(&mut self.pinned_edges);
+        self.graph.add_pinned_edges(pinned);
         self.graph
     }
 
     /// Builds without resolving edges (for incremental updates).
-    pub fn build_without_resolve(self) -> ArborGraph {
+    ///
+    /// Pinned edges are still applied: they need no resolution, so skipping
+    /// them here would silently drop the caller's exact edges.
+    pub fn build_without_resolve(mut self) -> ArborGraph {
+        let pinned = std::mem::take(&mut self.pinned_edges);
+        self.graph.add_pinned_edges(pinned);
         self.graph
     }
 }
@@ -654,5 +676,96 @@ mod tests {
             callees[0].qualified_name, "MathUtils.add",
             "static call must resolve to the qualified class, not a same-named sibling"
         );
+    }
+
+    /// A pinned edge is the whole point of the SCIP path: it must survive
+    /// intact even where name resolution would have picked a different target.
+    #[test]
+    fn pinned_edge_beats_the_ambiguous_name_match() {
+        let mut b = GraphBuilder::new();
+
+        // Two same-named definitions — exactly the case name resolution
+        // cannot decide, and a compiler index can.
+        let caller = CodeNode::new("pay", "Checkout.pay", NodeKind::Method, "src/Checkout.java");
+        let right = CodeNode::new(
+            "charge",
+            "Stripe.charge",
+            NodeKind::Method,
+            "src/Stripe.java",
+        );
+        let wrong = CodeNode::new("charge", "Mock.charge", NodeKind::Method, "src/Mock.java");
+
+        let (from_id, to_id) = (caller.id.clone(), right.id.clone());
+        b.add_nodes(vec![caller, right, wrong]);
+        b.add_pinned_edges(vec![PinnedEdge {
+            from_id,
+            to_id,
+            edge: Edge::new(EdgeKind::Calls),
+        }]);
+
+        let graph = b.build();
+
+        let pay = graph
+            .node_indexes()
+            .find(|&i| graph.get(i).unwrap().name == "pay")
+            .unwrap();
+        let callees = graph.get_callees(pay);
+        assert_eq!(callees.len(), 1);
+        assert_eq!(callees[0].qualified_name, "Stripe.charge");
+    }
+
+    #[test]
+    fn pinned_edge_to_a_missing_node_is_dropped_not_invented() {
+        let mut b = GraphBuilder::new();
+        let node = CodeNode::new("pay", "Checkout.pay", NodeKind::Method, "src/Checkout.java");
+        let from_id = node.id.clone();
+        b.add_nodes(vec![node]);
+        b.add_pinned_edges(vec![PinnedEdge {
+            from_id,
+            to_id: "not-a-real-node-id".to_string(),
+            edge: Edge::new(EdgeKind::Calls),
+        }]);
+
+        let graph = b.build();
+        assert_eq!(graph.node_count(), 1);
+        assert_eq!(graph.edge_count(), 0);
+    }
+
+    #[test]
+    fn pinned_self_edge_is_dropped() {
+        let mut b = GraphBuilder::new();
+        let node = CodeNode::new("recurse", "R.recurse", NodeKind::Method, "src/R.java");
+        let id = node.id.clone();
+        b.add_nodes(vec![node]);
+        b.add_pinned_edges(vec![PinnedEdge {
+            from_id: id.clone(),
+            to_id: id,
+            edge: Edge::new(EdgeKind::Calls),
+        }]);
+
+        assert_eq!(b.build().edge_count(), 0);
+    }
+
+    #[test]
+    fn pinned_edges_survive_build_without_resolve() {
+        let mut b = GraphBuilder::new();
+        let caller = CodeNode::new("pay", "Checkout.pay", NodeKind::Method, "src/Checkout.java");
+        let target = CodeNode::new(
+            "charge",
+            "Stripe.charge",
+            NodeKind::Method,
+            "src/Stripe.java",
+        );
+        let (from_id, to_id) = (caller.id.clone(), target.id.clone());
+        b.add_nodes(vec![caller, target]);
+        b.add_pinned_edges(vec![PinnedEdge {
+            from_id,
+            to_id,
+            edge: Edge::new(EdgeKind::Calls).with_confidence(0.5),
+        }]);
+
+        let graph = b.build_without_resolve();
+        assert_eq!(graph.edge_count(), 1);
+        assert_eq!(graph.edges().next().unwrap().confidence, 0.5);
     }
 }
