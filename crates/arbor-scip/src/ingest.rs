@@ -190,8 +190,21 @@ pub fn ingest_indexes(indexes: &[(PathBuf, Index)], options: &IngestOptions) -> 
 
         for document in &index.documents {
             stats.documents += 1;
-            if !document.language.is_empty() && !stats.languages.contains(&document.language) {
-                stats.languages.push(document.language.clone());
+            // Not every indexer sets `Document.language`; `scip-python` leaves
+            // it empty. Falling back to the scheme keeps the report honest
+            // rather than blank.
+            let language = match document.language.is_empty() {
+                false => Some(document.language.clone()),
+                true => document
+                    .occurrences
+                    .first()
+                    .and_then(|o| symbols::language_from_scheme(&o.symbol))
+                    .map(str::to_string),
+            };
+            if let Some(language) = language {
+                if !stats.languages.contains(&language) {
+                    stats.languages.push(language);
+                }
             }
 
             let style = symbols::style_for(

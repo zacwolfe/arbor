@@ -707,6 +707,45 @@ fn a_dirty_index_without_scip_java_serves_the_cache_and_explains() {
     assert!(output.status.success(), "must still answer from the cache");
 }
 
+/// A read command that triggers a rebuild must not print the machine-readable
+/// stats block into the middle of its own output.
+#[test]
+fn an_inline_rebuild_does_not_dump_json_into_a_human_command() {
+    let temp = setup_java_project();
+    let dir = temp.path();
+
+    run_arbor_stdout(dir, &["scip", "index.scip", "--root", "."]);
+
+    // Make the index look stale so the next read rebuilds.
+    let checkout = dir.join("src/main/java/com/example/Checkout.java");
+    let contents = fs::read_to_string(&checkout).unwrap();
+    fs::write(&checkout, format!("{contents}// touched\n")).unwrap();
+    let handle = fs::OpenOptions::new().write(true).open(&checkout).unwrap();
+    handle
+        .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(10))
+        .unwrap();
+    drop(handle);
+
+    // A stub indexer that reproduces the index, so the rebuild succeeds.
+    fs::copy(dir.join("index.scip"), dir.join("fixture.scip")).unwrap();
+    let bin = stub_scip_java(dir, true);
+    let output = run_arbor_with_path(dir, &bin, &["callers", "pay", "."]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        !stdout.contains("\"definitions\""),
+        "the rebuild's JSON stats block leaked into human output:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("referencesResolved"),
+        "the rebuild's JSON stats block leaked into human output:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Callers of") || stdout.contains("No callers"),
+        "the command's own answer must still be printed:\n{stdout}"
+    );
+}
+
 /// `--background` must refuse before detaching. Launching a worker that cannot
 /// possibly run anything sends the user to a log to find out nothing happened.
 #[test]

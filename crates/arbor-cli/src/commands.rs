@@ -387,7 +387,13 @@ fn auto_rebuild_scip(project_root: &Path, indexes: &[String]) -> Result<()> {
         );
     }
 
-    scip_ingest_at(project_root, &rebuild.indexes, false, false, true)?;
+    scip_ingest_at(
+        project_root,
+        &rebuild.indexes,
+        false,
+        false,
+        IngestReport::Silent,
+    )?;
 
     if let Ok(graph) = load_graph_binary(project_root) {
         let _ = task
@@ -1507,7 +1513,16 @@ pub fn scip(
     let resolved_path = resolve_project_path(root)?;
     init_arbor_dir(&resolved_path)?;
 
-    scip_ingest_at(&resolved_path, indexes, merge, no_dispatch, json_output)
+    scip_ingest_at(
+        &resolved_path,
+        indexes,
+        merge,
+        no_dispatch,
+        match json_output {
+            true => IngestReport::Json,
+            false => IngestReport::Human,
+        },
+    )
 }
 
 /// Prints the status of a detached rebuild, if there is one.
@@ -1735,7 +1750,13 @@ pub fn scip_background_worker(root: &Path, merge: bool, no_dispatch: bool) -> Re
 
     let indexes = rebuild.indexes.clone();
 
-    match scip_ingest_at(&resolved_path, &indexes, merge, no_dispatch, false) {
+    match scip_ingest_at(
+        &resolved_path,
+        &indexes,
+        merge,
+        no_dispatch,
+        IngestReport::Human,
+    ) {
         Ok(()) => {
             let graph = load_or_index_graph(&resolved_path)?;
             if let Some(task) = load_task() {
@@ -1832,12 +1853,24 @@ fn newest_source_mtime(root: &Path) -> i64 {
 }
 
 /// The ingest proper, shared by the foreground command and the worker.
+/// How an ingest should report itself.
+///
+/// `Silent` exists because the automatic rebuild runs *inside* another command:
+/// `arbor refactor` used to print a machine-readable stats block into the middle
+/// of its own human output, which is neither readable nor parseable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IngestReport {
+    Human,
+    Json,
+    Silent,
+}
+
 fn scip_ingest_at(
     resolved_path: &Path,
     indexes: &[PathBuf],
     merge: bool,
     no_dispatch: bool,
-    json_output: bool,
+    report: IngestReport,
 ) -> Result<()> {
     // Fail on a missing index before doing any work: a typo'd path is the
     // most likely mistake here, and a decode error deep in the run reads as
@@ -1848,7 +1881,7 @@ fn scip_ingest_at(
         }
     }
 
-    if !json_output {
+    if report == IngestReport::Human {
         println!("{}", "Ingesting SCIP index...".cyan());
     }
 
@@ -1879,9 +1912,15 @@ fn scip_ingest_at(
     save_graph_binary(resolved_path, &graph)?;
     write_scip_provenance(resolved_path, indexes, merge)?;
 
-    match json_output {
-        true => print_scip_json(&graph, &stats, &covered_files, pinned_total, dropped_edges)?,
-        false => print_scip_summary(&graph, &stats, &covered_files, pinned_total, dropped_edges),
+    match report {
+        IngestReport::Json => {
+            print_scip_json(&graph, &stats, &covered_files, pinned_total, dropped_edges)?
+        }
+        IngestReport::Human => {
+            print_scip_summary(&graph, &stats, &covered_files, pinned_total, dropped_edges)
+        }
+        // The caller is mid-command and prints its own one-line summary.
+        IngestReport::Silent => {}
     }
 
     Ok(())

@@ -109,6 +109,29 @@ pub fn style_for(language: &str, sample_symbol: Option<&str>) -> SymbolStyle {
     }
 }
 
+/// The language an indexer covers, named from its scheme.
+///
+/// `scip-python` and some others leave `Document.language` empty, which left
+/// Arbor reporting `languages: []` and printing an empty `()` after the tool
+/// name. The scheme names the indexer, and an indexer covers a known language,
+/// so this is derived rather than invented.
+pub fn language_from_scheme(symbol: &str) -> Option<&'static str> {
+    let scheme = parse_symbol(symbol).ok()?.scheme;
+    match scheme.as_str() {
+        "semanticdb" => Some("Java/Kotlin"),
+        "scip-typescript" => Some("TypeScript"),
+        "scip-python" => Some("Python"),
+        "rust-analyzer" => Some("Rust"),
+        "scip-clang" => Some("C/C++"),
+        "scip-dotnet" => Some("C#"),
+        "scip-go" => Some("Go"),
+        "scip-ruby" => Some("Ruby"),
+        "scip-php" => Some("PHP"),
+        "scip-dart" => Some("Dart"),
+        _ => None,
+    }
+}
+
 /// Lowercases and drops punctuation so `C#`, `CSharp` and `c_sharp` agree.
 fn normalize(language: &str) -> String {
     language
