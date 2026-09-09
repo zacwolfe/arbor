@@ -33,9 +33,9 @@ how scopes are spelled (`.` versus `::`) and what an indexer calls a constructor
 
 | Language | Indexer | Status in Arbor |
 |---|---|---|
-| Java, Kotlin | [`scip-java`] | **verified** on a 406-document Spring service. The only one Arbor also *runs* for you |
+| Java, Kotlin | [`scip-java`] | **verified** on a 406-document Spring service |
 | Rust | [`rust-analyzer`] | **verified** on Arbor itself — 69 documents, 2,109 nodes, 10,554 edges |
-| TypeScript, JavaScript | [`scip-typescript`] | ingests; bring your own index |
+| TypeScript, JavaScript | [`scip-typescript`] | **verified** on a Rust + TypeScript project, both languages in one graph |
 | Python | [`scip-python`] | ingests; bring your own index |
 | C, C++ | [`scip-clang`] | ingests; bring your own index |
 | C# | [`scip-dotnet`] | ingests; bring your own index |
@@ -48,15 +48,47 @@ how scopes are spelled (`.` versus `::`) and what an indexer calls a constructor
 tests, but no one has run that indexer end to end on a real repository and
 checked the result. Expect it to work; report it if it does not.
 
-Only `scip-java` is *invoked* by Arbor, because only its build-tool quirks have
-been worked through — see `crates/arbor-cli/src/scip_pipeline.rs`. Everything
-else you run yourself, then hand the `index.scip` to `arbor scip`.
+**Arbor can run any of them** — see below — but only the three marked *verified*
+have been driven end to end.
 
 `scip-java` upstream describes itself as a Java and Kotlin indexer. **Scala is
 not supported** by it, and Arbor has no Scala parser either — not even a
 fallback — so Scala projects have no path today.
 
-## Integrating an indexer
+## Letting Arbor run them
+
+If the indexer is on `PATH`, Arbor detects and runs it for you:
+
+```bash
+arbor scip --background .      # detached; poll with: arbor scip --task-status
+```
+
+Detection is by root marker — `build.gradle`/`pom.xml` → `scip-java`,
+`Cargo.toml` → `rust-analyzer`, `tsconfig.json` → `scip-typescript`, and so on.
+The table lives in `crates/arbor-cli/src/indexers.rs`; adding a language is one
+row.
+
+**A polyglot repository runs every indexer that matches.** A root with both
+`Cargo.toml` and `tsconfig.json` runs `rust-analyzer` and `scip-typescript`,
+collects both indexes into `.arbor/scip-indexes/`, and ingests them together, so
+both languages land in one graph. Two things make that safe rather than lucky:
+
+- indexes are collected under `.arbor/` because every one of these tools writes
+  to `index.scip` by default, so two indexers in one repository would otherwise
+  overwrite each other — and because `gradlew clean` deletes `build/`, which
+  would take the provenance `.arbor/scip.json` points at with it
+- an indexer that fails does not block the others. Its language is reported as
+  missing from the graph rather than silently absent, because "not indexed" and
+  "nothing calls this" look identical in a graph
+
+Markers are matched at the **root only**. A `tsconfig.json` three directories
+down is usually a sub-package with its own build, and walking the tree would
+make `arbor scip` start a compile for every vendored fixture in the repository.
+
+If an indexer is detected but not installed, Arbor prints its install command
+rather than guessing or failing silently.
+
+## Integrating an indexer by hand
 
 Every one of these follows the same three steps: install the indexer, produce
 `index.scip`, ingest it. Only step 2 differs.

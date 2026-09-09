@@ -11,6 +11,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 mod audit;
 mod commands;
 mod hook;
+mod indexers;
 mod scip_pipeline;
 
 #[derive(Parser)]

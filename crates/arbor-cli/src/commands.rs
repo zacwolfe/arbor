@@ -300,14 +300,15 @@ fn rebuild_already_failed_for_current_sources(project_root: &Path) -> bool {
 /// stale answer to a question about code you just changed is worse than a slow
 /// one. `--background` remains for when you would rather not wait.
 fn auto_rebuild_scip(project_root: &Path, indexes: &[String]) -> Result<()> {
-    if !binary_on_path("scip-java") {
-        eprintln!(
-            "{} Sources changed, but scip-java is not on PATH so the graph cannot be \
-refreshed — serving the cached graph.\n  \
-Install it (see the SCIP section of the README), then: arbor scip --background\n  \
-Indexed by something other than scip-java? Re-run that indexer, then: arbor scip <index.scip>",
-            "⚠".yellow()
-        );
+    let detected = crate::indexers::detect(project_root);
+    let runnable: Vec<_> = detected
+        .iter()
+        .copied()
+        .filter(|i| crate::indexers::on_path(i.binary))
+        .collect();
+
+    if runnable.is_empty() {
+        report_no_runnable_indexer(&detected);
         return Ok(());
     }
 
@@ -342,18 +343,26 @@ Indexed by something other than scip-java? Re-run that indexer, then: arbor scip
         .unwrap_or(0);
     let task =
         arbor_graph::ScipTask::new(format!("scip-{}", stamp), std::process::id(), "(inline)")
-            .progress(10, "Running scip-java (blocking)");
+            .progress(
+                10,
+                format!(
+                    "Running {} (blocking)",
+                    crate::indexers::describe(&runnable)
+                ),
+            );
     let _ = task.save(project_root);
 
-    let run = crate::scip_pipeline::run(project_root)?;
-    if !run.success {
+    let rebuild = crate::scip_pipeline::rebuild(project_root)?;
+    report_missing_indexers(&rebuild.missing);
+
+    if !rebuild.produced_anything() {
         let log_path = project_root
             .join(".arbor")
             .join(format!("scip-rebuild-{}.log", stamp));
-        let _ = fs::write(&log_path, &run.output);
+        let _ = fs::write(&log_path, &rebuild.log);
         let _ = task
             .clone()
-            .failed("scip-java failed; the existing graph was left untouched")
+            .failed("indexing produced no index; the existing graph was left untouched")
             .save(project_root);
 
         eprintln!(
@@ -367,15 +376,18 @@ Indexed by something other than scip-java? Re-run that indexer, then: arbor scip
         return Ok(());
     }
 
-    let discovered = discover_scip_indexes(project_root)?;
-    if discovered.is_empty() {
-        let _ = task
-            .failed("build succeeded but produced no index")
-            .save(project_root);
-        return Ok(());
+    // A partial success is still reported. Kotlin indexed and TypeScript not is
+    // better than a stale graph, but only if the user knows which half is which.
+    for failed in rebuild.failures() {
+        eprintln!(
+            "{} {} failed; {} is missing from the refreshed graph.",
+            "⚠".yellow(),
+            failed.binary,
+            failed.language
+        );
     }
 
-    scip_ingest_at(project_root, &discovered, false, false, true)?;
+    scip_ingest_at(project_root, &rebuild.indexes, false, false, true)?;
 
     if let Ok(graph) = load_graph_binary(project_root) {
         let _ = task
@@ -390,6 +402,55 @@ Indexed by something other than scip-java? Re-run that indexer, then: arbor scip
     }
 
     Ok(())
+}
+
+/// Explains why no rebuild happened, naming the exact install command.
+///
+/// Two distinct situations, and conflating them wastes the user's time: nothing
+/// about the project looks indexable, versus the right indexer exists and is not
+/// installed.
+fn report_no_runnable_indexer(detected: &[&'static crate::indexers::Indexer]) {
+    if detected.is_empty() {
+        eprintln!(
+            "{} Sources changed, but no SCIP indexer matches this project — serving the \
+cached graph.\n  \
+Re-run whichever indexer built the index, then: arbor scip <index.scip>",
+            "⚠".yellow()
+        );
+        return;
+    }
+
+    eprintln!(
+        "{} Sources changed, but no matching SCIP indexer is installed — serving the \
+cached graph.",
+        "⚠".yellow()
+    );
+    for indexer in detected {
+        eprintln!(
+            "  {} for {}: {}",
+            indexer.binary.cyan(),
+            indexer.language,
+            indexer.install.dimmed()
+        );
+    }
+    eprintln!("  Then: {}", "arbor scip --background".cyan());
+}
+
+/// Warns about indexers a project needs but does not have installed.
+///
+/// Silence here would be the worst outcome: the affected code would simply be
+/// absent from the graph, which reads as "nothing calls this" rather than as
+/// "this was never indexed".
+fn report_missing_indexers(missing: &[&'static crate::indexers::Indexer]) {
+    for indexer in missing {
+        eprintln!(
+            "{} {} not installed, so {} is not in the graph. Install: {}",
+            "⚠".yellow(),
+            indexer.binary,
+            indexer.language,
+            indexer.install.dimmed()
+        );
+    }
 }
 
 /// Blocks until a running rebuild reaches a terminal state.
@@ -1594,7 +1655,8 @@ Stop it:   kill {}",
     Ok(())
 }
 
-/// The detached worker: run scip-java, then ingest. Not for direct use.
+/// The detached worker: run every applicable indexer, then ingest. Not for
+/// direct use.
 pub fn scip_background_worker(root: &Path, merge: bool, no_dispatch: bool) -> Result<()> {
     let resolved_path = resolve_project_path(root)?;
 
@@ -1603,48 +1665,69 @@ pub fn scip_background_worker(root: &Path, merge: bool, no_dispatch: bool) -> Re
         let _ = t.save(&resolved_path);
     };
 
-    if let Some(task) = load_task() {
-        save(task.progress(10, "Running scip-java (full compile)"));
+    let detected = crate::indexers::detect(&resolved_path);
+    let runnable: Vec<_> = detected
+        .iter()
+        .copied()
+        .filter(|i| crate::indexers::on_path(i.binary))
+        .collect();
+
+    if runnable.is_empty() {
+        report_no_runnable_indexer(&detected);
+        if let Some(task) = load_task() {
+            save(task.failed("no applicable SCIP indexer is installed"));
+        }
+        return Err("no applicable SCIP indexer is installed".into());
     }
 
-    let run = match crate::scip_pipeline::run(&resolved_path) {
-        Ok(run) => run,
+    if let Some(task) = load_task() {
+        save(task.progress(
+            10,
+            format!("Running {}", crate::indexers::describe(&runnable)),
+        ));
+    }
+
+    let rebuild = match crate::scip_pipeline::rebuild(&resolved_path) {
+        Ok(rebuild) => rebuild,
         Err(e) => {
             if let Some(task) = load_task() {
-                save(task.failed(format!("could not launch scip-java: {e}")));
+                save(task.failed(format!("could not launch an indexer: {e}")));
             }
             return Err(e.into());
         }
     };
 
-    println!("{}", run.output);
+    println!("{}", rebuild.log);
+    report_missing_indexers(&rebuild.missing);
 
-    if !run.success {
+    if !rebuild.produced_anything() {
         if let Some(task) = load_task() {
-            save(
-                task.failed(
-                    "scip-java failed; see the log. The existing graph was left untouched.",
-                ),
-            );
+            save(task.failed(
+                "indexing produced no index; see the log. The existing graph was left untouched.",
+            ));
         }
-        return Err("scip-java failed".into());
+        return Err("indexing produced no index".into());
+    }
+
+    for failed in rebuild.failures() {
+        eprintln!(
+            "{} {} failed; {} is missing from the refreshed graph.",
+            "⚠".yellow(),
+            failed.binary,
+            failed.language
+        );
     }
 
     if let Some(task) = load_task() {
-        let note = match run.retried {
+        let retried = rebuild.ran.iter().any(|(_, run)| run.retried);
+        let note = match retried {
             true => "Ingesting (configuration cache was disabled for the retry)",
             false => "Ingesting",
         };
         save(task.progress(70, note));
     }
 
-    let indexes = discover_scip_indexes(&resolved_path)?;
-    if indexes.is_empty() {
-        if let Some(task) = load_task() {
-            save(task.failed("build succeeded but produced no non-empty index.scip"));
-        }
-        return Err("no index produced".into());
-    }
+    let indexes = rebuild.indexes.clone();
 
     match scip_ingest_at(&resolved_path, &indexes, merge, no_dispatch, false) {
         Ok(()) => {
@@ -1740,40 +1823,6 @@ fn newest_source_mtime(root: &Path) -> i64 {
         true => cache_mtime as i64 + 1,
         false => cache_mtime as i64,
     }
-}
-
-/// Every non-empty `index.scip` under a project root.
-///
-/// Skips the empty files a failed build leaves behind, and passes every module
-/// in one call — a symbol defined in module B is only linkable while B's
-/// definitions are in scope.
-fn discover_scip_indexes(project_root: &Path) -> Result<Vec<PathBuf>> {
-    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-        let Ok(entries) = fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if path.is_dir() {
-                if name != ".git" && name != ".arbor" && name != "node_modules" {
-                    walk(&path, out);
-                }
-            } else if name == "index.scip" {
-                if let Ok(meta) = entry.metadata() {
-                    if meta.len() > 0 {
-                        out.push(path);
-                    }
-                }
-            }
-        }
-    }
-
-    let mut out = Vec::new();
-    walk(project_root, &mut out);
-    out.sort();
-    Ok(out)
 }
 
 /// The ingest proper, shared by the foreground command and the worker.

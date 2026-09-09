@@ -689,12 +689,59 @@ fn a_dirty_index_without_scip_java_serves_the_cache_and_explains() {
     // Rebuilding needs the compiler, so the advice must be --background rather
     // than re-ingesting an index that is itself stale.
     assert!(
-        stderr.contains("not on PATH"),
-        "should name the missing prerequisite, got: {stderr}"
+        stderr.contains("no matching SCIP indexer is installed"),
+        "should say the prerequisite is missing, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("scip-java"),
+        "should name which indexer this project needs, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("coursier bootstrap"),
+        "should give the install command, not just the tool name, got: {stderr}"
     );
     assert!(
         stderr.contains("arbor scip --background"),
         "must recommend --background, got: {stderr}"
+    );
+    assert!(output.status.success(), "must still answer from the cache");
+}
+
+/// A project no indexer recognises is a different problem from a missing
+/// indexer, and saying "install scip-java" there would send the user nowhere.
+#[test]
+fn a_dirty_index_with_no_applicable_indexer_says_so() {
+    let temp = setup_java_project();
+    let dir = temp.path();
+
+    run_arbor_stdout(dir, &["scip", "index.scip", "--root", "."]);
+
+    // Drop the build file so no indexer's markers match. `.git` keeps this a
+    // workspace root, which `pom.xml` was doubling as.
+    fs::create_dir_all(dir.join(".git")).unwrap();
+    for marker in ["build.gradle", "build.gradle.kts", "pom.xml"] {
+        let _ = fs::remove_file(dir.join(marker));
+    }
+
+    let checkout = dir.join("src/main/java/com/example/Checkout.java");
+    let contents = fs::read_to_string(&checkout).unwrap();
+    fs::write(&checkout, format!("{contents}// touched\n")).unwrap();
+    let handle = fs::OpenOptions::new().write(true).open(&checkout).unwrap();
+    handle
+        .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(10))
+        .unwrap();
+    drop(handle);
+
+    let output = run_arbor_without_scip_java(dir, &["callers", "pay", "."]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        stderr.contains("no SCIP indexer matches this project"),
+        "should distinguish 'nothing applies' from 'not installed', got: {stderr}"
+    );
+    assert!(
+        stderr.contains("arbor scip <index.scip>"),
+        "the only route left is ingesting an index built elsewhere, got: {stderr}"
     );
     assert!(output.status.success(), "must still answer from the cache");
 }
