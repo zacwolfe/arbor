@@ -1,30 +1,44 @@
-//! Arbor SCIP — compiler-accurate graphs for JVM languages.
+//! Arbor SCIP — compiler-accurate graphs from a SCIP index.
 //!
 //! Arbor's own parsers read source text with Tree-sitter. That is fast and
 //! needs no build, but it cannot resolve `repository.findOne()` to a
 //! definition, because doing so requires knowing the type of `repository` —
 //! and type inference is a compiler's job, not a grammar's.
 //!
-//! Rather than reimplement javac, this crate consumes [SCIP], the open code
-//! indexing format, as produced by [`scip-java`] for Java, Kotlin, and Scala.
-//! Those indexers run as compiler plugins, so their symbol resolution is
-//! exactly the compiler's. Arbor keeps the layers it is actually good at —
-//! ranking, entry-point detection, context slicing, MCP — and stops guessing
-//! at the parts a compiler already knows.
+//! Rather than reimplement a type checker per language, this crate consumes
+//! [SCIP], the open code indexing format. Its indexers run as compiler plugins
+//! or on top of a language server, so their symbol resolution is exactly the
+//! compiler's. Arbor keeps the layers it is actually good at — ranking,
+//! entry-point detection, context slicing, MCP — and stops guessing at the
+//! parts a compiler already knows.
+//!
+//! The SCIP grammar is the same whatever produced the index, so ingestion here
+//! is language-neutral. [`crate::symbols::SymbolStyle`] carries the only two
+//! things that differ between languages: how scopes are spelled (`.` versus
+//! `::`) and what an indexer calls a constructor.
+//!
+//! Verified against [`scip-java`] (Java, Kotlin). Other indexers —
+//! `scip-typescript`, `scip-python`, `rust-analyzer scip`, `scip-clang`,
+//! `scip-dotnet`, `scip-go`, `scip-ruby`, `scip-php`, `scip-dart` — emit the
+//! same format and are ingested by the same code path, but only `scip-java` is
+//! driven automatically by [`arbor scip`]. For the rest, run the indexer
+//! yourself and pass the resulting `index.scip`.
 //!
 //! [SCIP]: https://github.com/scip-code/scip
 //! [`scip-java`]: https://github.com/scip-code/scip-java
+//! [`arbor scip`]: https://github.com/Anandb71/arbor
 //!
 //! # What this buys over Tree-sitter
 //!
 //! - **Resolved method calls.** `obj.method()` becomes a real edge. Tree-sitter
 //!   records it as the reference `obj.method`, which matches no symbol — the
 //!   receiver is a variable, not a type — so it never resolves. That is the
-//!   single largest gap in Arbor's JVM coverage.
+//!   single largest gap in Arbor's coverage, and it is the same gap in Java,
+//!   TypeScript and Python.
 //! - **Virtual dispatch.** SCIP records the override hierarchy, so a call to
 //!   `PaymentGateway.charge()` also reaches `StripeGateway.charge()`. A call
 //!   graph that stops at the interface understates blast radius on any
-//!   interface-driven codebase — which is most JVM code.
+//!   interface-driven codebase.
 //! - **Honest confidence.** Every edge here is compiler-proven and carries
 //!   confidence `1.0`. Only dispatch expansion goes lower, weighted by how
 //!   many implementations are in play.

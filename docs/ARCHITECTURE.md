@@ -112,10 +112,12 @@ pub struct ArborGraph {
 
 ### arbor-scip
 
-Ingests [SCIP](https://github.com/scip-code/scip) indexes produced by
-[`scip-java`](https://github.com/scip-code/scip-java), giving Java, Kotlin, and
-Scala projects a graph built from the compiler's own symbol resolution rather
-than from Tree-sitter's pattern matching.
+Ingests [SCIP](https://github.com/scip-code/scip) indexes, giving a graph built
+from the compiler's own symbol resolution rather than from Tree-sitter's pattern
+matching. Language-neutral: the SCIP grammar does not vary by producer, so one
+code path reads `scip-java`, `scip-typescript`, `scip-python`,
+`rust-analyzer scip` and the rest. Only `scip-java` (Java, Kotlin) is invoked by
+Arbor itself; for other languages, run the indexer and pass its `index.scip`.
 
 - **Why**: Tree-sitter records `gateway.charge()` as the reference
   `gateway.charge`, which matches no symbol, so no edge is created. Resolving it

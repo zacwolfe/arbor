@@ -207,7 +207,7 @@ When `arbor query` returns test files but you need production code, do NOT fall 
 2. Run `arbor callers "symbol" .` to trace upstream into production code
 3. Or run `arbor file-graph "src/main/..." .` if you already know the production file path
 
-### If this project uses a SCIP index (JVM: Java, Kotlin, Scala)
+### If this project uses a SCIP index (compiler-produced, any language)
 
 `arbor status .` prints `Source: SCIP index (...)` when it does. On such a project the graph comes from the compiler, not from Tree-sitter, so `obj.method()` calls and interface implementations are real edges rather than absent ones.
 
@@ -217,7 +217,7 @@ Three rules follow:
 2. **Refreshing requires a compile, so it is the human's call.** If a query looks stale, say so and suggest they run `arbor scip --background`. Do not run it yourself — it starts a multi-minute Gradle build.
 3. **A rebuild in flight is pollable**: `arbor scip --task-status` is read-only and safe to run.
 
-If a read command prints `Java sources changed ... rebuilding now`, it is compiling before answering. Let it finish rather than interrupting.
+If a read command prints `Sources changed ... rebuilding now`, it is compiling before answering. Let it finish rather than interrupting.
 
 "#;
 

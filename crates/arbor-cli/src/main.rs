@@ -460,15 +460,21 @@ enum Commands {
         focus: Option<String>,
     },
 
-    /// Build the graph from compiler-produced SCIP indexes (Java, Kotlin, Scala)
+    /// Build the graph from compiler-produced SCIP indexes
     ///
     /// Tree-sitter cannot resolve `obj.method()` without type inference, so
-    /// Arbor drops those calls. A SCIP index from scip-java carries the
-    /// compiler's own resolution, including the override hierarchy, so calls
-    /// and virtual dispatch become real edges.
+    /// Arbor drops those calls. A SCIP index carries the compiler's own
+    /// resolution, including the override hierarchy, so calls and virtual
+    /// dispatch become real edges.
+    ///
+    /// Any SCIP index is accepted: scip-java (Java, Kotlin),
+    /// scip-typescript, scip-python, `rust-analyzer scip`, scip-clang,
+    /// scip-dotnet, scip-go, scip-ruby, scip-php, scip-dart. Only scip-java is
+    /// invoked automatically by --background; run the others yourself.
     ///
     /// Produce an index first:
     ///   docker run -v $PWD:/sources ghcr.io/scip-code/scip-java:latest scip-java index
+    ///   scip-typescript index      # or: rust-analyzer scip .
     Scip {
         /// SCIP index files. Multi-module builds emit one per module — pass
         /// them all so cross-module edges resolve. Omit with --background or

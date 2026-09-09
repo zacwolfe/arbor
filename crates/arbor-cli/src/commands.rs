@@ -302,9 +302,10 @@ fn rebuild_already_failed_for_current_sources(project_root: &Path) -> bool {
 fn auto_rebuild_scip(project_root: &Path, indexes: &[String]) -> Result<()> {
     if !binary_on_path("scip-java") {
         eprintln!(
-            "{} Java sources changed, but scip-java is not on PATH so the graph cannot be \
+            "{} Sources changed, but scip-java is not on PATH so the graph cannot be \
 refreshed — serving the cached graph.\n  \
-Install it (see the JVM section of the README), then: arbor scip --background",
+Install it (see the SCIP section of the README), then: arbor scip --background\n  \
+Indexed by something other than scip-java? Re-run that indexer, then: arbor scip <index.scip>",
             "⚠".yellow()
         );
         return Ok(());
@@ -326,7 +327,7 @@ Install it (see the JVM section of the README), then: arbor scip --background",
     }
 
     eprintln!(
-        "{} Java sources changed since {} was built — rebuilding now (this runs the compiler).",
+        "{} Sources changed since {} was built — rebuilding now (this runs the compiler).",
         "⏳".yellow(),
         indexes.join(", ")
     );
@@ -584,7 +585,7 @@ fn load_or_index_graph(path: &Path) -> Result<arbor_graph::ArborGraph> {
                 true => "the last rebuild failed for these same sources",
             };
             eprintln!(
-                "{} Java sources are newer than the SCIP index, but {} — serving the \
+                "{} Sources are newer than the SCIP index, but {} — serving the \
 cached graph.\n  \
 Retry: arbor scip --background",
                 "⚠".yellow(),

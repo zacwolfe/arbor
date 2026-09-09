@@ -194,7 +194,12 @@ pub fn ingest_indexes(indexes: &[(PathBuf, Index)], options: &IngestOptions) -> 
                 stats.languages.push(document.language.clone());
             }
 
-            collect_definitions(document, options, &mut nodes, &mut defined);
+            let style = symbols::style_for(
+                &document.language,
+                document.occurrences.first().map(|o| o.symbol.as_str()),
+            );
+
+            collect_definitions(document, options, &style, &mut nodes, &mut defined);
         }
     }
 
@@ -245,6 +250,7 @@ pub fn ingest_indexes(indexes: &[(PathBuf, Index)], options: &IngestOptions) -> 
 fn collect_definitions(
     document: &Document,
     options: &IngestOptions,
+    style: &symbols::SymbolStyle,
     nodes: &mut Vec<CodeNode>,
     defined: &mut HashMap<String, DefinedSymbol>,
 ) {
@@ -256,7 +262,7 @@ fn collect_definitions(
             continue;
         }
 
-        let Some(facts) = symbols::parse(&occurrence.symbol) else {
+        let Some(facts) = symbols::parse(&occurrence.symbol, style) else {
             continue;
         };
 
@@ -364,7 +370,7 @@ fn collect_references(
         // a reference to one is not a gap in the index — it is simply not our
         // business. Filtering here keeps `references_external` meaning
         // "something we could have linked but the index does not define".
-        if symbols::parse(&occurrence.symbol).is_none() {
+        if !symbols::is_graph_symbol(&occurrence.symbol) {
             stats.references_ignored += 1;
             continue;
         }
@@ -431,7 +437,7 @@ fn build_enclosing_index(document: &Document) -> EnclosingIndex {
         .occurrences
         .iter()
         .filter(|occurrence| has_role(occurrence.symbol_roles, SymbolRole::Definition))
-        .filter(|occurrence| symbols::parse(&occurrence.symbol).is_some())
+        .filter(|occurrence| symbols::is_graph_symbol(&occurrence.symbol))
         .filter_map(|occurrence| {
             let name_span = occurrence_span(occurrence)?;
             let body_span = occurrence_enclosing_span(occurrence);

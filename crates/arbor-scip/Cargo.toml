@@ -7,7 +7,7 @@ repository.workspace = true
 homepage.workspace = true
 documentation.workspace = true
 readme.workspace = true
-description = "SCIP index ingestion for Arbor — compiler-accurate graphs for JVM languages"
+description = "SCIP index ingestion for Arbor — compiler-accurate code graphs"
 
 [dependencies]
 serde.workspace = true

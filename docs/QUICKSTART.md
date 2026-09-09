@@ -115,16 +115,22 @@ hooks (auto-init, grep blocking, daily project-skeleton injection), and
 allow-lists the read-only arbor commands so the agent runs them without a
 prompt. Re-running updates the block in place.
 
-## JVM projects: compiler-accurate graphs
+## Compiler-accurate graphs via SCIP
 
-Tree-sitter cannot resolve `obj.method()` — that needs the type of `obj`. For
-Java, Kotlin, and Scala, ingest a
-[SCIP](https://github.com/scip-code/scip) index instead:
+Tree-sitter cannot resolve `obj.method()` — that needs the type of `obj`. Ingest
+a [SCIP](https://github.com/scip-code/scip) index instead, from whichever
+indexer covers your language:
 
 ```bash
-scip-java index                     # requires JDK 17+; a full compile
+scip-java index                     # Java, Kotlin — requires JDK 17+; a full compile
+# scip-typescript index             # TypeScript, JavaScript
+# scip-python index .               # Python
+# rust-analyzer scip .              # Rust
 arbor scip index.scip --root .
 ```
+
+`scip-java` is the only one Arbor runs for you (`arbor scip --background`); the
+others you run yourself. See [SCIP.md](SCIP.md) for the full list.
 
 Then query exactly as above — same commands, exact edges. Refresh after code
 changes with `arbor scip --background` (detached) and poll it with

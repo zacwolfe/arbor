@@ -10,10 +10,15 @@
 //! The descriptor suffix (`/` package, `#` type, `.` term, `().` method) is
 //! what tells us the *kind* of the thing without any guessing — the reason a
 //! compiler-produced index beats pattern matching over source text.
+//!
+//! The grammar is identical across every indexer. Two things are not, and
+//! [`SymbolStyle`] carries exactly those: how a language spells the separator
+//! between scopes, and what an indexer calls a constructor when it does not
+//! classify one. Everything else here is language-neutral.
 
 use arbor_core::NodeKind;
 use scip::symbol::parse_symbol;
-use scip::types::{descriptor::Suffix, symbol_information, SymbolInformation};
+use scip::types::{descriptor::Suffix, symbol_information, Descriptor, SymbolInformation};
 
 /// What a SCIP symbol string means in Arbor's terms.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,37 +38,178 @@ pub struct SymbolFacts {
     pub kind: NodeKind,
 }
 
-/// Parses a global SCIP symbol into node facts.
+/// The language-shaped part of reading a SCIP symbol.
 ///
-/// Returns `None` for symbols that should never become graph vertices:
-/// locals, parameters, type parameters, metadata symbols, and anything whose
-/// descriptor list we cannot read. Local symbols in particular are per-file
-/// and enormously numerous; admitting them would bury the real structure.
-pub fn parse(symbol: &str) -> Option<SymbolFacts> {
+/// Deliberately data rather than a trait: the variation between languages here
+/// is two values, and expressing two values as polymorphism is how a 50-line
+/// change becomes a 500-line one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SymbolStyle {
+    /// Joins descriptor names into a qualified name — `.` for most languages,
+    /// `::` for Rust and C++.
+    pub separator: &'static str,
+
+    /// What this language's indexer calls a constructor when it emits one as an
+    /// ordinary method.
+    ///
+    /// Only a fallback: [`refine_kind`] already promotes anything the indexer
+    /// itself classifies as `Kind::Constructor`. This catches the indexers that
+    /// do not, `scip-java` among them.
+    pub ctor_names: &'static [&'static str],
+
+    /// Whether an `impl` type descriptor should be replaced by the type it is an
+    /// impl *of*, which the indexer keeps in the following type parameter.
+    ///
+    /// True for Rust only. Gated on the language rather than applied everywhere
+    /// because a type legitimately named `impl` is possible elsewhere, and
+    /// renaming it to its own type argument would be silently wrong.
+    pub unwrap_impl_blocks: bool,
+}
+
+impl Default for SymbolStyle {
+    /// Dot-separated, no constructor convention.
+    ///
+    /// The default is deliberately permissive: an unfamiliar indexer produces
+    /// slightly plainer names rather than no graph at all.
+    fn default() -> Self {
+        Self {
+            separator: ".",
+            ctor_names: &[],
+            unwrap_impl_blocks: false,
+        }
+    }
+}
+
+/// Picks a style for one document.
+///
+/// Keys on SCIP's own `Document.language`, which is the semantically correct
+/// field and is standardised. `sample_symbol` is a fallback for indexers that
+/// leave the language blank — the symbol's scheme names the indexer, which
+/// implies the language just as well.
+pub fn style_for(language: &str, sample_symbol: Option<&str>) -> SymbolStyle {
+    let normalized = normalize(language);
+    if !normalized.is_empty() {
+        return style_for_language(&normalized);
+    }
+
+    let scheme = sample_symbol
+        .and_then(|symbol| parse_symbol(symbol).ok())
+        .map(|parsed| parsed.scheme)
+        .unwrap_or_default();
+
+    match scheme.as_str() {
+        "semanticdb" => style_for_language("java"),
+        "scip-typescript" => style_for_language("typescript"),
+        "scip-python" => style_for_language("python"),
+        "rust-analyzer" => style_for_language("rust"),
+        "scip-clang" => style_for_language("cpp"),
+        "scip-ruby" => style_for_language("ruby"),
+        "scip-php" => style_for_language("php"),
+        _ => SymbolStyle::default(),
+    }
+}
+
+/// Lowercases and drops punctuation so `C#`, `CSharp` and `c_sharp` agree.
+fn normalize(language: &str) -> String {
+    language
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+fn style_for_language(normalized: &str) -> SymbolStyle {
+    match normalized {
+        // `<init>` is how the JVM names a constructor; SCIP emits it as an
+        // ordinary method, but callers reason about it as construction.
+        "java" | "kotlin" | "scala" | "groovy" => SymbolStyle {
+            separator: ".",
+            ctor_names: &["<init>"],
+            unwrap_impl_blocks: false,
+        },
+        "typescript" | "javascript" | "typescriptreact" | "javascriptreact" | "flow" => {
+            SymbolStyle {
+                separator: ".",
+                ctor_names: &["constructor"],
+                unwrap_impl_blocks: false,
+            }
+        }
+        "python" => SymbolStyle {
+            separator: ".",
+            ctor_names: &["__init__"],
+            unwrap_impl_blocks: false,
+        },
+        "ruby" => SymbolStyle {
+            separator: ".",
+            ctor_names: &["initialize"],
+            unwrap_impl_blocks: false,
+        },
+        "php" => SymbolStyle {
+            separator: ".",
+            ctor_names: &["__construct"],
+            unwrap_impl_blocks: false,
+        },
+        // Rust's `new` is a convention, not a constructor — rust-analyzer emits
+        // it as the plain associated function it is, and calling it a
+        // constructor here would invent a distinction the language lacks.
+        "rust" => SymbolStyle {
+            separator: "::",
+            ctor_names: &[],
+            unwrap_impl_blocks: true,
+        },
+        "cpp" | "objectivecpp" | "cuda" => SymbolStyle {
+            separator: "::",
+            ctor_names: &[],
+            unwrap_impl_blocks: false,
+        },
+        _ => SymbolStyle::default(),
+    }
+}
+
+/// Whether a symbol could ever be a graph vertex.
+///
+/// Cheaper than [`parse`] and independent of any language style, which is why
+/// the reference pass uses it: filtering locals and parameters is the same
+/// question in every language.
+pub fn is_graph_symbol(symbol: &str) -> bool {
+    vertex_descriptors(symbol).is_some()
+}
+
+/// The descriptor list of a symbol that could be a vertex, or `None`.
+///
+/// Local symbols are rejected outright: they are per-file and enormously
+/// numerous, and admitting them would bury the real structure.
+fn vertex_descriptors(symbol: &str) -> Option<Vec<Descriptor>> {
     if symbol.is_empty() || scip::symbol::is_local_symbol(symbol) {
         return None;
     }
 
-    let parsed = parse_symbol(symbol).ok()?;
-    let descriptors = parsed.descriptors;
+    let descriptors = parse_symbol(symbol).ok()?.descriptors;
+    let last = descriptors.last()?;
+    // A suffix with no node kind (parameter, type parameter, metadata) is not a
+    // vertex, so there is nothing to report.
+    suffix_to_kind(
+        last.suffix.enum_value().ok()?,
+        &last.name,
+        &SymbolStyle::default(),
+    )?;
+
+    Some(descriptors)
+}
+
+/// Parses a global SCIP symbol into node facts.
+///
+/// Returns `None` for symbols that should never become graph vertices:
+/// locals, parameters, type parameters, metadata symbols, and anything whose
+/// descriptor list we cannot read.
+pub fn parse(symbol: &str, style: &SymbolStyle) -> Option<SymbolFacts> {
+    let descriptors = vertex_descriptors(symbol)?;
     let last = descriptors.last()?;
 
-    let kind = suffix_to_kind(last.suffix.enum_value().ok()?, &last.name)?;
+    let kind = suffix_to_kind(last.suffix.enum_value().ok()?, &last.name, style)?;
 
-    // Package descriptors join with `.`; a method or field hangs off its type
-    // with `.` too, which is exactly Java/Kotlin/Scala FQN notation.
-    let mut qualified_name = descriptors
-        .iter()
-        .filter(|d| {
-            !matches!(
-                d.suffix.enum_value(),
-                Ok(Suffix::TypeParameter) | Ok(Suffix::Parameter) | Ok(Suffix::Meta)
-            )
-        })
-        .map(|d| d.name.as_str())
-        .filter(|name| !name.is_empty())
-        .collect::<Vec<_>>()
-        .join(".");
+    let named = strip_file_path_prefix(&descriptors);
+    let mut qualified_name = scope_names(named, style).join(style.separator);
 
     if !last.disambiguator.is_empty() {
         qualified_name.push_str(&last.disambiguator);
@@ -80,14 +226,101 @@ pub fn parse(symbol: &str) -> Option<SymbolFacts> {
     })
 }
 
+/// The scope names that make up a qualified name, in order.
+///
+/// Type parameters, parameters and metadata never name a scope, so they are
+/// dropped — except when they are the only place the scope's real name is kept,
+/// which is what [`SymbolStyle::unwrap_impl_blocks`] is about.
+fn scope_names<'a>(descriptors: &'a [Descriptor], style: &SymbolStyle) -> Vec<&'a str> {
+    let mut names = Vec::with_capacity(descriptors.len());
+
+    for (position, descriptor) in descriptors.iter().enumerate() {
+        let suffix = descriptor.suffix.enum_value();
+
+        if style.unwrap_impl_blocks
+            && matches!(suffix, Ok(Suffix::Type))
+            && descriptor.name == "impl"
+        {
+            // `rust-analyzer` writes an inherent method as
+            // `graph/impl#[ArborGraph]add_pinned_edges().` — the type is a
+            // *type parameter* descriptor, and `impl` is the type. Taking the
+            // descriptors at face value yields `graph::impl::add_pinned_edges`,
+            // which names a keyword instead of the receiver. Substituting the
+            // first type parameter gives `graph::ArborGraph::add_pinned_edges`,
+            // which is how the path is actually written in Rust.
+            //
+            // A trait impl carries two — `impl#[`Vec<T, A>`][IntoIterator]` —
+            // and the receiver is the first. The trait is recoverable from the
+            // `is_implementation` relationships if it is ever wanted.
+            if let Some(receiver) = descriptors
+                .get(position + 1)
+                .filter(|next| matches!(next.suffix.enum_value(), Ok(Suffix::TypeParameter)))
+                .map(|next| next.name.as_str())
+                .filter(|name| !name.is_empty())
+            {
+                names.push(receiver);
+                continue;
+            }
+        }
+
+        if matches!(
+            suffix,
+            Ok(Suffix::TypeParameter) | Ok(Suffix::Parameter) | Ok(Suffix::Meta)
+        ) {
+            continue;
+        }
+
+        if !descriptor.name.is_empty() {
+            names.push(descriptor.name.as_str());
+        }
+    }
+
+    names
+}
+
+/// Drops the leading namespace descriptors that spell out a source file path.
+///
+/// `scip-typescript` puts the file path in them — `src/`foo.ts`/Bar#baz().` —
+/// where `scip-java` puts a package. Joining a path with `.` yields
+/// `src.foo.ts.Bar.baz`, which reads as nonsense and matches nothing a user
+/// would type. The path is already on [`arbor_core::CodeNode::file`], and
+/// `CodeNode::compute_id` hashes that file in, so dropping it here costs no
+/// uniqueness.
+///
+/// Detected by extension rather than by indexer, so it covers every indexer
+/// that path-qualifies without needing to know which ones those are.
+fn strip_file_path_prefix(descriptors: &[Descriptor]) -> &[Descriptor] {
+    let file_at = descriptors.iter().rposition(|d| {
+        matches!(
+            d.suffix.enum_value(),
+            Ok(Suffix::Namespace) | Ok(Suffix::Package)
+        ) && looks_like_source_file(&d.name)
+    });
+
+    let Some(index) = file_at else {
+        return descriptors;
+    };
+
+    match descriptors.get(index + 1..) {
+        // The symbol is the file itself. Keep it, named after the file, rather
+        // than returning nothing and dropping the module node entirely.
+        Some([]) | None => &descriptors[index..=index],
+        Some(rest) => rest,
+    }
+}
+
+/// Whether a descriptor name is a source file name rather than a scope name.
+fn looks_like_source_file(name: &str) -> bool {
+    name.rsplit_once('.')
+        .is_some_and(|(stem, ext)| !stem.is_empty() && arbor_core::languages::is_supported(ext))
+}
+
 /// Maps a descriptor suffix to a node kind.
 ///
 /// `None` means "not a graph vertex".
-fn suffix_to_kind(suffix: Suffix, name: &str) -> Option<NodeKind> {
+fn suffix_to_kind(suffix: Suffix, name: &str, style: &SymbolStyle) -> Option<NodeKind> {
     match suffix {
-        // `<init>` is how the JVM names a constructor; SCIP emits it as an
-        // ordinary method, but callers reason about it as construction.
-        Suffix::Method if name == "<init>" => Some(NodeKind::Constructor),
+        Suffix::Method if style.ctor_names.contains(&name) => Some(NodeKind::Constructor),
         Suffix::Method => Some(NodeKind::Method),
         Suffix::Type => Some(NodeKind::Class),
         Suffix::Term => Some(NodeKind::Field),
@@ -156,9 +389,17 @@ pub fn is_callable(kind: NodeKind) -> bool {
 mod tests {
     use super::*;
 
+    fn jvm() -> SymbolStyle {
+        style_for("Java", None)
+    }
+
     #[test]
     fn parses_java_method_symbol() {
-        let facts = parse("semanticdb maven . . com/example/UserService#validate().").unwrap();
+        let facts = parse(
+            "semanticdb maven . . com/example/UserService#validate().",
+            &jvm(),
+        )
+        .unwrap();
         assert_eq!(facts.qualified_name, "com.example.UserService.validate");
         assert_eq!(facts.simple_name, "validate");
         assert_eq!(facts.kind, NodeKind::Method);
@@ -166,28 +407,32 @@ mod tests {
 
     #[test]
     fn parses_java_type_symbol() {
-        let facts = parse("semanticdb maven . . com/example/UserService#").unwrap();
+        let facts = parse("semanticdb maven . . com/example/UserService#", &jvm()).unwrap();
         assert_eq!(facts.qualified_name, "com.example.UserService");
         assert_eq!(facts.kind, NodeKind::Class);
     }
 
     #[test]
     fn parses_field_symbol() {
-        let facts = parse("semanticdb maven . . com/example/UserService#repo.").unwrap();
+        let facts = parse("semanticdb maven . . com/example/UserService#repo.", &jvm()).unwrap();
         assert_eq!(facts.qualified_name, "com.example.UserService.repo");
         assert_eq!(facts.kind, NodeKind::Field);
     }
 
     #[test]
     fn constructor_recognised_from_init() {
-        let facts = parse("semanticdb maven . . com/example/UserService#`<init>`().").unwrap();
+        let facts = parse(
+            "semanticdb maven . . com/example/UserService#`<init>`().",
+            &jvm(),
+        )
+        .unwrap();
         assert_eq!(facts.kind, NodeKind::Constructor);
     }
 
     #[test]
     fn overloads_get_distinct_qualified_names() {
-        let a = parse("semanticdb maven . . com/example/Svc#find().").unwrap();
-        let b = parse("semanticdb maven . . com/example/Svc#find(+1).").unwrap();
+        let a = parse("semanticdb maven . . com/example/Svc#find().", &jvm()).unwrap();
+        let b = parse("semanticdb maven . . com/example/Svc#find(+1).", &jvm()).unwrap();
         assert_ne!(a.qualified_name, b.qualified_name);
         assert_eq!(b.qualified_name, "com.example.Svc.find+1");
         // Both still answer to the same searchable simple name.
@@ -196,12 +441,154 @@ mod tests {
 
     #[test]
     fn local_symbols_are_rejected() {
-        assert!(parse("local 12").is_none());
+        assert!(parse("local 12", &jvm()).is_none());
+        assert!(!is_graph_symbol("local 12"));
     }
 
     #[test]
     fn empty_symbol_is_rejected() {
-        assert!(parse("").is_none());
+        assert!(parse("", &jvm()).is_none());
+        assert!(!is_graph_symbol(""));
+    }
+
+    #[test]
+    fn typescript_file_path_is_not_part_of_the_name() {
+        // scip-typescript puts the source file's path in the leading namespace
+        // descriptors. Keeping it would read `src.userService.ts.UserService.find`.
+        let style = style_for("TypeScript", None);
+        let facts = parse(
+            "scip-typescript npm app 1.0.0 `src/userService.ts`/UserService#find().",
+            &style,
+        )
+        .unwrap();
+        assert_eq!(facts.qualified_name, "UserService.find");
+        assert_eq!(facts.kind, NodeKind::Method);
+    }
+
+    #[test]
+    fn typescript_module_symbol_keeps_the_file_name() {
+        // Stripping the path must not leave nothing: the file's own symbol is a
+        // real module node.
+        let style = style_for("TypeScript", None);
+        let facts = parse(
+            "scip-typescript npm app 1.0.0 `src/userService.ts`/",
+            &style,
+        )
+        .unwrap();
+        assert_eq!(facts.qualified_name, "src/userService.ts");
+        assert_eq!(facts.kind, NodeKind::Module);
+    }
+
+    #[test]
+    fn typescript_constructor_is_recognised() {
+        let style = style_for("TypeScript", None);
+        let facts = parse(
+            "scip-typescript npm app 1.0.0 `src/svc.ts`/Svc#constructor().",
+            &style,
+        )
+        .unwrap();
+        assert_eq!(facts.kind, NodeKind::Constructor);
+    }
+
+    #[test]
+    fn python_keeps_its_module_path() {
+        // Python's namespace descriptors are module names, not file names, and
+        // the module path is part of how Python code is referred to.
+        let style = style_for("Python", None);
+        let facts = parse(
+            "scip-python python app 1.0 app/svc/UserService#find().",
+            &style,
+        )
+        .unwrap();
+        assert_eq!(facts.qualified_name, "app.svc.UserService.find");
+    }
+
+    #[test]
+    fn python_dunder_init_is_a_constructor() {
+        let style = style_for("Python", None);
+        let facts = parse(
+            "scip-python python app 1.0 app/svc/User#__init__().",
+            &style,
+        )
+        .unwrap();
+        assert_eq!(facts.kind, NodeKind::Constructor);
+    }
+
+    #[test]
+    fn rust_impl_block_is_named_after_its_type() {
+        // rust-analyzer writes the receiver as a type parameter of an `impl`
+        // type descriptor. Taken literally that reads `graph::impl::add_edge`.
+        let style = style_for("Rust", None);
+        let facts = parse(
+            "rust-analyzer cargo arbor-graph 3.0.0 graph/impl#[ArborGraph]add_pinned_edges().",
+            &style,
+        )
+        .unwrap();
+        assert_eq!(facts.qualified_name, "graph::ArborGraph::add_pinned_edges");
+    }
+
+    #[test]
+    fn rust_trait_impl_takes_the_receiver_not_the_trait() {
+        let style = style_for("Rust", None);
+        let facts = parse(
+            "rust-analyzer cargo alloc . vec/impl#[`Vec<T, A>`][IntoIterator]into_iter().",
+            &style,
+        )
+        .unwrap();
+        assert_eq!(facts.qualified_name, "vec::Vec<T, A>::into_iter");
+    }
+
+    #[test]
+    fn impl_unwrapping_is_rust_only() {
+        // A Java type really named `impl` must keep its name.
+        let style = style_for("Java", None);
+        let facts = parse("semanticdb maven . . com/example/impl#[T]get().", &style).unwrap();
+        assert_eq!(facts.qualified_name, "com.example.impl.get");
+    }
+
+    #[test]
+    fn rust_uses_path_separators() {
+        let style = style_for("Rust", None);
+        let facts = parse(
+            "rust-analyzer cargo arbor 0.1.0 graph/ArborGraph#add_edge().",
+            &style,
+        )
+        .unwrap();
+        assert_eq!(facts.qualified_name, "graph::ArborGraph::add_edge");
+    }
+
+    #[test]
+    fn rust_new_is_not_a_constructor() {
+        // `new` is a naming convention in Rust, not a language construct.
+        let style = style_for("Rust", None);
+        let facts = parse(
+            "rust-analyzer cargo arbor 0.1.0 graph/ArborGraph#new().",
+            &style,
+        )
+        .unwrap();
+        assert_eq!(facts.kind, NodeKind::Method);
+    }
+
+    #[test]
+    fn style_falls_back_to_the_scheme_when_language_is_blank() {
+        let style = style_for("", Some("rust-analyzer cargo arbor 0.1.0 graph/Foo#bar()."));
+        assert_eq!(style.separator, "::");
+
+        let style = style_for("", Some("semanticdb maven . . com/example/Svc#find()."));
+        assert_eq!(style.ctor_names, &["<init>"]);
+    }
+
+    #[test]
+    fn unknown_language_still_produces_a_usable_name() {
+        let style = style_for("Brainfuck", None);
+        let facts = parse("scip-bf pkg . . a/b/C#d().", &style).unwrap();
+        assert_eq!(facts.qualified_name, "a.b.C.d");
+    }
+
+    #[test]
+    fn language_names_normalise() {
+        assert_eq!(style_for("C#", None), style_for("csharp", None));
+        assert_eq!(style_for("TypeScript", None), style_for("typescript", None));
     }
 
     #[test]

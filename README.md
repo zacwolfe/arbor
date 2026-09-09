@@ -252,7 +252,7 @@ Every tool returns `{ ok, tool, data, meta: { suggested_next_tool, suggested_nex
 | `arbor agent review` | Autonomous PR architecture review |
 | `arbor agent onboard` | Codebase onboarding guide |
 | `arbor agent guard` | Real-time architectural safety gate |
-| `arbor scip <index.scip>` | Build the graph from a compiler-produced SCIP index (JVM) |
+| `arbor scip <index.scip>` | Build the graph from a compiler-produced SCIP index |
 | `arbor bridge` | MCP server (add `--http` for HTTP transport) |
 | `arbor watch` | Live re-index on file changes |
 | `arbor gui` | Native desktop UI |
@@ -307,11 +307,25 @@ Pinned installs: [docs/INSTALL.md](docs/INSTALL.md)
 
 [Adding languages →](docs/ADDING_LANGUAGES.md)
 
-JVM projects can go further than Tree-sitter allows — see below.
+Any language with a SCIP indexer can go further than Tree-sitter allows — see
+below.
 
 ---
 
-## JVM: compiler-accurate graphs via scip-java
+## Compiler-accurate graphs via SCIP
+
+Arbor ingests any [SCIP](https://github.com/scip-code/scip) index, whatever
+produced it: `scip-java` (Java, Kotlin), `scip-typescript`, `scip-python`,
+`rust-analyzer scip`, `scip-clang`, `scip-dotnet`, `scip-go`, `scip-ruby`,
+`scip-php`, `scip-dart`. The format does not vary by producer, so one code path
+reads them all — see [docs/SCIP.md](docs/SCIP.md).
+
+The rest of this section walks through `scip-java`, because it is the one Arbor
+also **runs** for you (`arbor scip --background`) and the one verified against a
+real index. For the others: run the indexer, then
+`arbor scip index.scip --root .`.
+
+### Why it matters, in Java
 
 Tree-sitter reads source text. It cannot resolve this:
 
@@ -381,8 +395,13 @@ against real indexes.
 From the repository root, after a build that compiles cleanly:
 
 ```bash
-scip-java index                    # auto-detects Gradle / Maven / sbt / Bazel
+scip-java index                    # auto-detects Gradle or Maven
 ```
+
+**Gradle and Maven only.** `scip-java` describes itself as a Java and Kotlin
+indexer, and `--build-tool` accepts `gradle` with Maven auto-detected. An sbt
+project fails with `No build tool detected in workspace`; there is no flag that
+helps, and Arbor has no Scala parser to fall back on either.
 
 **Gradle with the configuration cache enabled** (`org.gradle.configuration-cache=true`
 in `gradle.properties`) fails with two errors — the real one being
@@ -527,7 +546,7 @@ rebuild the graph, not just the stale-cache read:
 
 | Command | On a SCIP project |
 |---------|-------------------|
-| `arbor callers` / `callees` / `map` / … | If Java sources are newer than `index.scip`, **rebuild synchronously** (runs the compiler), then answer. Otherwise serve the SCIP graph. If the cache cannot be read, refuse rather than fall back to Tree-sitter. |
+| `arbor callers` / `callees` / `map` / … | If sources are newer than `index.scip`, **rebuild synchronously** (runs the compiler), then answer. Otherwise serve the SCIP graph. If the cache cannot be read, refuse rather than fall back to Tree-sitter. |
 | `arbor index` | **Refused.** `arbor index --force` is the deliberate downgrade; it proceeds and clears the marker. |
 | `arbor index --changed-only` | **Refused.** The worst case, not the mildest: the two indexers build qualified names differently (`Svc.find` vs `com.pkg.Svc.find`), so a partial re-parse *duplicates* nodes rather than replacing them. |
 | `arbor status` / `export` | Report and emit the SCIP graph; `status` names its source. |
@@ -581,7 +600,7 @@ When any Java source is newer than the index, the next arbor command rebuilds
 before answering:
 
 ```
-⏳ Java sources changed since index.scip was built — rebuilding now (this runs the compiler).
+⏳ Sources changed since index.scip was built — rebuilding now (this runs the compiler).
   Prefer not to wait? Ctrl-C, then: arbor scip --background
 ✓ Graph refreshed: 10596 nodes, 45543 edges
 ```
@@ -601,7 +620,7 @@ scripts, where a read command turning into a multi-minute build is not
 acceptable:
 
 ```
-⚠ Java sources are newer than the SCIP index, but auto-rebuild is disabled
+⚠ Sources are newer than the SCIP index, but auto-rebuild is disabled
   (ARBOR_NO_AUTO_REBUILD) — serving the cached graph.
 ```
 
