@@ -11,6 +11,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 mod audit;
 mod commands;
 mod hook;
+mod scip_pipeline;
 
 #[derive(Parser)]
 #[command(name = "arbor")]
@@ -71,6 +72,11 @@ enum Commands {
         /// Disable caching (force full re-index)
         #[arg(long)]
         no_cache: bool,
+
+        /// Re-index with Tree-sitter even if this project's graph came from a
+        /// SCIP index. Replaces compiler-resolved edges with guessed ones.
+        #[arg(long)]
+        force: bool,
     },
 
     /// Search the code graph
@@ -454,6 +460,53 @@ enum Commands {
         focus: Option<String>,
     },
 
+    /// Build the graph from compiler-produced SCIP indexes (Java, Kotlin, Scala)
+    ///
+    /// Tree-sitter cannot resolve `obj.method()` without type inference, so
+    /// Arbor drops those calls. A SCIP index from scip-java carries the
+    /// compiler's own resolution, including the override hierarchy, so calls
+    /// and virtual dispatch become real edges.
+    ///
+    /// Produce an index first:
+    ///   docker run -v $PWD:/sources ghcr.io/scip-code/scip-java:latest scip-java index
+    Scip {
+        /// SCIP index files. Multi-module builds emit one per module — pass
+        /// them all so cross-module edges resolve. Omit with --background or
+        /// --task-status.
+        #[arg(num_args = 0..)]
+        indexes: Vec<PathBuf>,
+
+        /// Regenerate the index and re-ingest in a detached process, returning
+        /// a task handle. Invokes scip-java, which is a full compile.
+        #[arg(long)]
+        background: bool,
+
+        /// Print the status of a detached rebuild.
+        #[arg(long)]
+        task_status: bool,
+
+        /// Internal: the detached worker entry point.
+        #[arg(long, hide = true)]
+        background_worker: bool,
+
+        /// Project root the index's relative paths hang off
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+
+        /// Also Tree-sitter-index files the SCIP index does not cover, for
+        /// polyglot repositories
+        #[arg(long)]
+        merge: bool,
+
+        /// Do not synthesise call edges for virtual dispatch
+        #[arg(long)]
+        no_dispatch: bool,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Built-in agent workflows for autonomous code analysis
     Agent {
         #[command(subcommand)]
@@ -517,8 +570,7 @@ async fn main() {
             path,
             follow_symlinks,
             no_cache,
-        } => commands::init(&path)
-            .and_then(|_| commands::index(&path, None, follow_symlinks, no_cache, false)),
+        } => commands::setup(&path, follow_symlinks, no_cache),
         Commands::Init { path } => commands::init(&path),
         Commands::Index {
             path,
@@ -526,12 +578,14 @@ async fn main() {
             output,
             follow_symlinks,
             no_cache,
+            force,
         } => commands::index(
             &path,
             output.as_deref(),
             follow_symlinks,
             no_cache,
             changed_only,
+            force,
         ),
         Commands::Query {
             query,
@@ -631,6 +685,32 @@ async fn main() {
             focus_changed,
             focus.as_deref(),
         ),
+        Commands::Scip {
+            indexes,
+            background,
+            task_status,
+            background_worker,
+            root,
+            merge,
+            no_dispatch,
+            json,
+        } => {
+            if task_status {
+                commands::scip_task_status(&root, json)
+            } else if background_worker {
+                commands::scip_background_worker(&root, merge, no_dispatch)
+            } else if background {
+                commands::scip_background(&root, merge, no_dispatch)
+            } else if indexes.is_empty() {
+                Err(
+                    "no SCIP index given. Pass one or more index.scip paths, or use \
+--background to regenerate, or --task-status to poll a running rebuild."
+                        .into(),
+                )
+            } else {
+                commands::scip(&indexes, &root, merge, no_dispatch, json)
+            }
+        }
         Commands::Agent { action } => match action {
             AgentAction::Review { path, json } => commands::agent_review(&path, json),
             AgentAction::Onboard { path, json } => commands::agent_onboard(&path, json),

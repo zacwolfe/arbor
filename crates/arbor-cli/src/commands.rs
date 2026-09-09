@@ -190,6 +190,255 @@ fn graph_binary_path(path: &Path) -> PathBuf {
     path.join(".arbor").join("graph.bin")
 }
 
+/// Marker recording that the cached graph came from a SCIP index.
+///
+/// Its presence changes how a stale cache is handled: a Tree-sitter re-index
+/// would silently replace compiler-resolved edges with guessed ones, which is
+/// a downgrade the user did not ask for.
+fn scip_provenance_path(path: &Path) -> PathBuf {
+    path.join(".arbor").join("scip.json")
+}
+
+fn write_scip_provenance(path: &Path, indexes: &[PathBuf], merged: bool) -> Result<()> {
+    let generated_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let payload = serde_json::json!({
+        "indexes": indexes.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+        "merged": merged,
+        "generatedAt": generated_at,
+    });
+
+    fs::write(
+        scip_provenance_path(path),
+        serde_json::to_string_pretty(&payload)?,
+    )?;
+
+    Ok(())
+}
+
+/// Clears the SCIP marker, called when a Tree-sitter index deliberately
+/// replaces the graph.
+fn clear_scip_provenance(path: &Path) {
+    let marker = scip_provenance_path(path);
+    if marker.exists() {
+        let _ = fs::remove_file(marker);
+    }
+}
+
+/// The SCIP index files the cached graph was built from, if any.
+fn scip_provenance_indexes(path: &Path) -> Option<Vec<String>> {
+    arbor_graph::cache::scip_indexes(path)
+}
+
+/// Guards against `load_or_index_graph` re-entering itself: the auto-rebuild
+/// ingests, and ingest paths load the graph again.
+static AUTO_REBUILD_IN_PROGRESS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the SCIP index itself is older than the source it describes.
+///
+/// Deliberately compared against `index.scip`, not the graph cache. Re-running
+/// `arbor scip <index>` rewrites the cache without regenerating the index, so a
+/// cache-based check would report "fresh" for a graph that is just as stale as
+/// before.
+fn scip_index_is_stale(project_root: &Path, indexes: &[String]) -> bool {
+    // The oldest index is the conservative choice: if any module's index
+    // predates a source edit, the merged graph is stale.
+    let oldest = indexes
+        .iter()
+        .map(|i| {
+            let path = Path::new(i);
+            match path.is_absolute() {
+                true => path.to_path_buf(),
+                false => project_root.join(path),
+            }
+        })
+        .filter_map(|p| cache_mtime_secs(&p))
+        .min();
+
+    match oldest {
+        Some(index_mtime) => arbor_watcher::sources_newer_than(project_root, index_mtime, false),
+        // No readable index means we cannot tell; do not claim staleness.
+        None => false,
+    }
+}
+
+/// Whether the automatic rebuild is allowed to run.
+///
+/// Off via `ARBOR_NO_AUTO_REBUILD=1` for CI and scripts, where a read command
+/// silently turning into a multi-minute Gradle build is not acceptable.
+fn auto_rebuild_enabled() -> bool {
+    match std::env::var("ARBOR_NO_AUTO_REBUILD") {
+        Ok(v) => !(v == "1" || v.eq_ignore_ascii_case("true")),
+        Err(_) => true,
+    }
+}
+
+/// Whether a rebuild already failed for this same source state.
+///
+/// Without this, a project that does not compile would start a fresh Gradle
+/// build on *every* arbor invocation and never succeed.
+fn rebuild_already_failed_for_current_sources(project_root: &Path) -> bool {
+    let Some(task) = arbor_graph::ScipTask::load(project_root) else {
+        return false;
+    };
+    if task.status != arbor_graph::ScipTaskStatus::Failed {
+        return false;
+    }
+
+    // If nothing has been touched since the failed attempt, retrying would
+    // fail again in exactly the same way.
+    !arbor_watcher::sources_newer_than(project_root, task.updated_at, false)
+}
+
+/// Rebuilds the SCIP index synchronously, then re-ingests.
+///
+/// Blocking on purpose: the caller asked a question about the graph, and a
+/// stale answer to a question about code you just changed is worse than a slow
+/// one. `--background` remains for when you would rather not wait.
+fn auto_rebuild_scip(project_root: &Path, indexes: &[String]) -> Result<()> {
+    if !binary_on_path("scip-java") {
+        eprintln!(
+            "{} Java sources changed, but scip-java is not on PATH so the graph cannot be \
+refreshed — serving the cached graph.\n  \
+Install it (see the JVM section of the README), then: arbor scip --background",
+            "⚠".yellow()
+        );
+        return Ok(());
+    }
+
+    // Never start a second build alongside a running one: they contend on the
+    // same Gradle project lock. Wait for the existing one instead.
+    if let Some(existing) = arbor_graph::ScipTask::load(project_root) {
+        if !existing.status.is_terminal() && existing.worker_alive() {
+            eprintln!(
+                "{} A background rebuild is already running (task {}, pid {}); waiting for it.",
+                "⏳".yellow(),
+                existing.id,
+                existing.pid
+            );
+            wait_for_rebuild(project_root, &existing.id);
+            return Ok(());
+        }
+    }
+
+    eprintln!(
+        "{} Java sources changed since {} was built — rebuilding now (this runs the compiler).",
+        "⏳".yellow(),
+        indexes.join(", ")
+    );
+    eprintln!(
+        "  {}",
+        "Prefer not to wait? Ctrl-C, then: arbor scip --background".dimmed()
+    );
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let task =
+        arbor_graph::ScipTask::new(format!("scip-{}", stamp), std::process::id(), "(inline)")
+            .progress(10, "Running scip-java (blocking)");
+    let _ = task.save(project_root);
+
+    let run = crate::scip_pipeline::run(project_root)?;
+    if !run.success {
+        let log_path = project_root
+            .join(".arbor")
+            .join(format!("scip-rebuild-{}.log", stamp));
+        let _ = fs::write(&log_path, &run.output);
+        let _ = task
+            .clone()
+            .failed("scip-java failed; the existing graph was left untouched")
+            .save(project_root);
+
+        eprintln!(
+            "{} Rebuild failed; serving the previous graph. Log: {}",
+            "⚠".yellow(),
+            log_path.display()
+        );
+        // Deliberately not an error: the caller's question can still be
+        // answered from the cache, and failing outright would make every
+        // command unusable while the project does not compile.
+        return Ok(());
+    }
+
+    let discovered = discover_scip_indexes(project_root)?;
+    if discovered.is_empty() {
+        let _ = task
+            .failed("build succeeded but produced no index")
+            .save(project_root);
+        return Ok(());
+    }
+
+    scip_ingest_at(project_root, &discovered, false, false, true)?;
+
+    if let Ok(graph) = load_graph_binary(project_root) {
+        let _ = task
+            .completed(graph.node_count(), graph.edge_count())
+            .save(project_root);
+        eprintln!(
+            "{} Graph refreshed: {} nodes, {} edges",
+            "✓".green(),
+            graph.node_count(),
+            graph.edge_count()
+        );
+    }
+
+    Ok(())
+}
+
+/// Blocks until a running rebuild reaches a terminal state.
+fn wait_for_rebuild(project_root: &Path, task_id: &str) {
+    loop {
+        std::thread::sleep(Duration::from_millis(500));
+        let Some(task) = arbor_graph::ScipTask::load(project_root) else {
+            return;
+        };
+        if task.id != task_id {
+            return;
+        }
+        if task.status.is_terminal() {
+            return;
+        }
+        if !task.worker_alive() {
+            return;
+        }
+    }
+}
+
+/// Refuses a Tree-sitter rebuild of a graph that came from a SCIP index.
+///
+/// Two reasons this must fail rather than fall back. First, Tree-sitter cannot
+/// resolve `obj.method()`, so rebuilding silently trades compiler-resolved
+/// edges for guessed ones — a `refactor` that reported 438 affected nodes
+/// starts reporting "entry point, nothing calls it". Second, the two indexers
+/// build qualified names differently (`Svc.find` vs `com.pkg.Svc.find`), so a
+/// partial re-parse does not replace SCIP nodes, it *duplicates* them.
+fn refuse_if_scip_provenanced(path: &Path, operation: &str) -> Result<()> {
+    let Some(indexes) = scip_provenance_indexes(path) else {
+        return Ok(());
+    };
+
+    let refresh = match indexes.is_empty() {
+        true => "arbor scip <index.scip> --root .".to_string(),
+        false => format!("arbor scip {} --root .", indexes.join(" ")),
+    };
+
+    Err(format!(
+        "This project's graph was built from a SCIP index, so Arbor will not {operation} \
+with Tree-sitter — it cannot resolve `obj.method()` and would replace exact \
+edges with guesses.\n  \
+To refresh from the compiler:  {refresh}\n  \
+Or regenerate the index first:  scripts/scip-index.sh\n  \
+To deliberately go back to Tree-sitter:  arbor index . --force"
+    )
+    .into())
+}
+
 fn graph_store_path(path: &Path) -> PathBuf {
     path.join(".arbor").join("cache")
 }
@@ -248,15 +497,8 @@ fn load_graph_snapshot(path: &Path) -> Result<arbor_graph::ArborGraph> {
 }
 
 fn load_graph_binary(path: &Path) -> Result<arbor_graph::ArborGraph> {
-    let graph_path = graph_binary_path(path);
-    if !graph_path.exists() {
-        return Err(format!("Binary graph not found at {}", graph_path.display()).into());
-    }
-
-    let bytes = fs::read(graph_path)?;
-    let mut graph: arbor_graph::ArborGraph = bincode::deserialize(&bytes)?;
-    graph.rebuild_search_index();
-    Ok(graph)
+    // Shared with the GUI via arbor-graph so the two front ends cannot drift.
+    arbor_graph::cache::load_binary(path).map_err(Into::into)
 }
 
 fn load_graph_from_store(path: &Path) -> Result<arbor_graph::ArborGraph> {
@@ -320,7 +562,40 @@ fn load_or_index_graph(path: &Path) -> Result<arbor_graph::ArborGraph> {
     let store_path = graph_store_path(path);
     let bridge_may_be_running = store_path.join("db").exists();
 
-    let stale = !bridge_may_be_running && cache_is_stale(path);
+    let mut stale = !bridge_may_be_running && cache_is_stale(path);
+
+    // A SCIP-built graph is never rebuilt with Tree-sitter. Either the SCIP
+    // index is refreshed (which means running the compiler), or the cache is
+    // served as-is — but never silently downgraded.
+    if let Some(indexes) = scip_provenance_indexes(path) {
+        let reentrant = AUTO_REBUILD_IN_PROGRESS.load(std::sync::atomic::Ordering::Relaxed);
+        let dirty = !reentrant && scip_index_is_stale(path, &indexes);
+
+        if dirty && auto_rebuild_enabled() && !rebuild_already_failed_for_current_sources(path) {
+            AUTO_REBUILD_IN_PROGRESS.store(true, std::sync::atomic::Ordering::Relaxed);
+            let outcome = auto_rebuild_scip(path, &indexes);
+            AUTO_REBUILD_IN_PROGRESS.store(false, std::sync::atomic::Ordering::Relaxed);
+            outcome?;
+        } else if dirty {
+            // Either auto-rebuild is switched off, or the last attempt already
+            // failed for this same source state and would fail identically.
+            let reason = match auto_rebuild_enabled() {
+                false => "auto-rebuild is disabled (ARBOR_NO_AUTO_REBUILD)",
+                true => "the last rebuild failed for these same sources",
+            };
+            eprintln!(
+                "{} Java sources are newer than the SCIP index, but {} — serving the \
+cached graph.\n  \
+Retry: arbor scip --background",
+                "⚠".yellow(),
+                reason
+            );
+        }
+
+        // Whatever happened above, do not fall through to a Tree-sitter rebuild.
+        stale = false;
+    }
+
     if !stale {
         if let Ok(graph) = load_graph_binary(path) {
             return Ok(graph);
@@ -344,10 +619,42 @@ fn load_or_index_graph(path: &Path) -> Result<arbor_graph::ArborGraph> {
         }
     }
 
+    // Every read command lands here when the cache cannot be loaded. Rebuilding
+    // with Tree-sitter and persisting it would destroy a SCIP graph as a side
+    // effect of a plain `arbor callers` — so refuse instead.
+    refuse_if_scip_provenanced(path, "rebuild the graph from source")?;
+
     let result = index_directory(path, IndexOptions::default())?;
     save_graph_snapshot(path, &result.graph)?;
     save_graph_binary(path, &result.graph)?;
     Ok(result.graph)
+}
+
+/// The graph a long-running server or bridge should serve.
+///
+/// On a SCIP-provenanced project the cached compiler-resolved graph wins: a
+/// fresh Tree-sitter index would hand agents guessed edges while the cache on
+/// disk holds exact ones.
+fn graph_for_serving(path: &Path, options: IndexOptions) -> Result<arbor_graph::ArborGraph> {
+    if scip_provenance_indexes(path).is_some() {
+        if let Ok(graph) = load_graph_binary(path) {
+            println!(
+                "{} Serving the SCIP graph from cache (Tree-sitter would downgrade it)",
+                "✓".green()
+            );
+            return Ok(graph);
+        }
+        if let Ok(graph) = load_graph_snapshot(path) {
+            println!(
+                "{} Serving the SCIP graph from cache (Tree-sitter would downgrade it)",
+                "✓".green()
+            );
+            return Ok(graph);
+        }
+        refuse_if_scip_provenanced(path, "index this project")?;
+    }
+
+    Ok(index_directory(path, options)?.graph)
 }
 
 fn run_git(path: &Path, args: &[&str]) -> Result<String> {
@@ -862,6 +1169,36 @@ fn resolve_node_or_file_target(
         .map(|node| (node.file.clone(), node.line_start))
 }
 
+/// Whether an executable of this name is resolvable on `PATH`.
+///
+/// Deliberately not [`command_exists`], which probes with `--version` and
+/// requires exit 0. `scip-java` is a JVM launcher: that probe would spawn a
+/// whole JVM to answer "does this exist", and a coursier-bootstrapped launcher
+/// need not support the flag at all.
+fn binary_on_path(name: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+
+    std::env::split_paths(&path).any(|dir| {
+        let candidate = dir.join(name);
+        match candidate.metadata() {
+            Ok(meta) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    meta.is_file() && meta.permissions().mode() & 0o111 != 0
+                }
+                #[cfg(not(unix))]
+                {
+                    meta.is_file()
+                }
+            }
+            Err(_) => false,
+        }
+    })
+}
+
 fn command_exists(cmd: &str) -> bool {
     // Input validation to prevent command injection (CWE-78)
     if cmd.is_empty() || cmd.len() > 255 {
@@ -946,6 +1283,39 @@ pub fn init(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// One-shot init + index.
+///
+/// Split out from the plain `init`/`index` pairing so a project that already
+/// has a SCIP graph is reported as set up rather than refused: `index` would
+/// correctly decline to overwrite it, but `setup` has no `--force` to offer, so
+/// the user would otherwise be left with an error and no way forward.
+pub fn setup(path: &Path, follow_symlinks: bool, no_cache: bool) -> Result<()> {
+    init(path)?;
+
+    let resolved_path = resolve_project_path(path)?;
+    if let Some(indexes) = scip_provenance_indexes(&resolved_path) {
+        println!(
+            "{} Already set up from a SCIP index ({}) — nothing to do.",
+            "✓".green(),
+            indexes.join(", ")
+        );
+        if let Some(graph) = arbor_graph::cache::load_any(&resolved_path) {
+            println!(
+                "  {} nodes, {} edges",
+                graph.node_count().to_string().cyan(),
+                graph.edge_count().to_string().cyan()
+            );
+        }
+        println!(
+            "  Refresh with {} after a code change.",
+            "arbor scip --background".cyan()
+        );
+        return Ok(());
+    }
+
+    index(path, None, follow_symlinks, no_cache, false, false)
+}
+
 /// Index a directory and build the code graph.
 pub fn index(
     path: &Path,
@@ -953,8 +1323,16 @@ pub fn index(
     follow_symlinks: bool,
     no_cache: bool,
     changed_only: bool,
+    force: bool,
 ) -> Result<()> {
     let resolved_path = resolve_project_path(path)?;
+
+    // Gated before the --changed-only branch: an incremental Tree-sitter patch
+    // into a SCIP graph is the worst case, not the mildest, because it leaves
+    // the two naming schemes side by side in one graph.
+    if !force {
+        refuse_if_scip_provenanced(&resolved_path, "re-index this project")?;
+    }
     let was_initialized = init_arbor_dir(&resolved_path)?;
     if was_initialized {
         println!(
@@ -1031,11 +1409,592 @@ pub fn index(
 
     save_graph_snapshot(&resolved_path, &result.graph)?;
     save_graph_binary(&resolved_path, &result.graph)?;
+    // This graph is Tree-sitter's, so any SCIP provenance no longer describes
+    // it — leaving the marker would suppress legitimate re-indexes forever.
+    clear_scip_provenance(&resolved_path);
     println!(
         "{} Saved graph snapshot to {}",
         "✓".green(),
         graph_snapshot_path(&resolved_path).display()
     );
+
+    Ok(())
+}
+
+/// Build the graph from compiler-produced SCIP indexes.
+///
+/// Arbor's Tree-sitter parsers cannot resolve `obj.method()` — that needs the
+/// type of `obj`, which is a compiler's job. `scip-java` runs as a compiler
+/// plugin, so its resolution *is* javac's. Ingesting its output gives Arbor
+/// exact call edges and the override hierarchy for JVM code, and leaves the
+/// ranking, slicing, and MCP layers untouched.
+pub fn scip(
+    indexes: &[PathBuf],
+    root: &Path,
+    merge: bool,
+    no_dispatch: bool,
+    json_output: bool,
+) -> Result<()> {
+    let resolved_path = resolve_project_path(root)?;
+    init_arbor_dir(&resolved_path)?;
+
+    scip_ingest_at(&resolved_path, indexes, merge, no_dispatch, json_output)
+}
+
+/// Prints the status of a detached rebuild, if there is one.
+pub fn scip_task_status(root: &Path, json_output: bool) -> Result<()> {
+    let resolved_path = resolve_project_path(root)?;
+
+    let Some(task) = arbor_graph::ScipTask::load(&resolved_path) else {
+        return match json_output {
+            true => {
+                println!("{}", serde_json::json!({"task": null}));
+                Ok(())
+            }
+            false => {
+                println!("No detached SCIP rebuild has been started here.");
+                Ok(())
+            }
+        };
+    };
+
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&task.to_task_response())?
+        );
+        return Ok(());
+    }
+
+    let label = match task.status {
+        arbor_graph::ScipTaskStatus::Running => "⏳ running".yellow(),
+        arbor_graph::ScipTaskStatus::Completed => "✓ completed".green(),
+        arbor_graph::ScipTaskStatus::Failed => "✗ failed".red(),
+    };
+    println!(
+        "{} {}  ({}% — {})",
+        task.id.cyan(),
+        label,
+        task.progress,
+        task.message
+    );
+    println!("  {} {}", "pid:".dimmed(), task.pid);
+    println!("  {} {}", "log:".dimmed(), task.log);
+    println!("  {} {}s ago", "updated:".dimmed(), task.age_secs());
+    if let Some(error) = &task.error {
+        println!("\n{} {}", "error:".red(), error);
+        println!("  Full build output is in the log above.");
+    }
+
+    Ok(())
+}
+
+/// Spawns a detached rebuild and returns immediately with a task handle.
+///
+/// A `scip-java` run is a full compile, so this cannot block the shell. The
+/// existing graph stays queryable throughout, and a failed build leaves it
+/// completely untouched — the worker only writes once ingestion succeeds.
+pub fn scip_background(root: &Path, merge: bool, no_dispatch: bool) -> Result<()> {
+    let resolved_path = resolve_project_path(root)?;
+    init_arbor_dir(&resolved_path)?;
+
+    if !binary_on_path("scip-java") {
+        return Err("scip-java not on PATH. --background invokes it directly; \
+see the JVM section of Arbor's README."
+            .into());
+    }
+
+    // Refuse to stack rebuilds: two concurrent scip-java runs contend on the
+    // same Gradle project lock and would serialise anyway, at the cost of an
+    // unexplained stall. Liveness is asked of the OS rather than inferred from
+    // the record's age — a killed worker would otherwise block every later
+    // rebuild until an arbitrary timeout expired.
+    if let Some(existing) = arbor_graph::ScipTask::load(&resolved_path) {
+        if !existing.status.is_terminal() {
+            if existing.worker_alive() {
+                return Err(format!(
+                    "A rebuild is already running (task {}, pid {}, started {}s ago).\n  \
+Watch it:  arbor scip --task-status\n  \
+Log:       {}\n  \
+Stop it:   kill {}",
+                    existing.id,
+                    existing.pid,
+                    existing.age_secs(),
+                    existing.log,
+                    existing.pid
+                )
+                .into());
+            }
+
+            // The worker is gone but never reported an outcome, so it was
+            // killed or interrupted. Record that before starting over, or the
+            // history would claim it is still running.
+            println!(
+                "{} Previous rebuild (task {}, pid {}) is no longer running — treating it as interrupted.",
+                "⚠".yellow(),
+                existing.id,
+                existing.pid
+            );
+            let _ = existing
+                .clone()
+                .failed("worker exited without reporting an outcome (killed or interrupted)")
+                .save(&resolved_path);
+        }
+    }
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let log_path = resolved_path
+        .join(".arbor")
+        .join(format!("scip-rebuild-{}.log", stamp));
+
+    let exe = std::env::current_exe()?;
+    let mut cmd = Command::new(exe);
+    cmd.arg("scip")
+        .arg("--background-worker")
+        .arg("--root")
+        .arg(&resolved_path);
+    if merge {
+        cmd.arg("--merge");
+    }
+    if no_dispatch {
+        cmd.arg("--no-dispatch");
+    }
+
+    let log_file = fs::File::create(&log_path)?;
+    let child = cmd
+        .stdin(std::process::Stdio::null())
+        .stdout(log_file.try_clone()?)
+        .stderr(log_file)
+        .spawn()?;
+
+    let task = arbor_graph::ScipTask::new(
+        format!("scip-{}", stamp),
+        child.id(),
+        log_path.display().to_string(),
+    );
+    task.save(&resolved_path)?;
+
+    println!("{} Rebuild started in the background", "✓".green());
+    println!("  {} {}", "task:".dimmed(), task.id.cyan());
+    println!("  {} {}", "pid:".dimmed(), child.id());
+    println!("  {} {}", "log:".dimmed(), log_path.display());
+    println!();
+    println!("  Poll it:   {}", "arbor scip --task-status".cyan());
+    println!(
+        "  Follow it: {}",
+        format!("tail -f {}", log_path.display()).cyan()
+    );
+    println!();
+    println!("The current graph stays queryable. A failed build changes nothing.");
+
+    Ok(())
+}
+
+/// The detached worker: run scip-java, then ingest. Not for direct use.
+pub fn scip_background_worker(root: &Path, merge: bool, no_dispatch: bool) -> Result<()> {
+    let resolved_path = resolve_project_path(root)?;
+
+    let load_task = || arbor_graph::ScipTask::load(&resolved_path);
+    let save = |t: arbor_graph::ScipTask| {
+        let _ = t.save(&resolved_path);
+    };
+
+    if let Some(task) = load_task() {
+        save(task.progress(10, "Running scip-java (full compile)"));
+    }
+
+    let run = match crate::scip_pipeline::run(&resolved_path) {
+        Ok(run) => run,
+        Err(e) => {
+            if let Some(task) = load_task() {
+                save(task.failed(format!("could not launch scip-java: {e}")));
+            }
+            return Err(e.into());
+        }
+    };
+
+    println!("{}", run.output);
+
+    if !run.success {
+        if let Some(task) = load_task() {
+            save(
+                task.failed(
+                    "scip-java failed; see the log. The existing graph was left untouched.",
+                ),
+            );
+        }
+        return Err("scip-java failed".into());
+    }
+
+    if let Some(task) = load_task() {
+        let note = match run.retried {
+            true => "Ingesting (configuration cache was disabled for the retry)",
+            false => "Ingesting",
+        };
+        save(task.progress(70, note));
+    }
+
+    let indexes = discover_scip_indexes(&resolved_path)?;
+    if indexes.is_empty() {
+        if let Some(task) = load_task() {
+            save(task.failed("build succeeded but produced no non-empty index.scip"));
+        }
+        return Err("no index produced".into());
+    }
+
+    match scip_ingest_at(&resolved_path, &indexes, merge, no_dispatch, false) {
+        Ok(()) => {
+            let graph = load_or_index_graph(&resolved_path)?;
+            if let Some(task) = load_task() {
+                save(task.completed(graph.node_count(), graph.edge_count()));
+            }
+            Ok(())
+        }
+        Err(e) => {
+            if let Some(task) = load_task() {
+                save(task.failed(format!("ingest failed: {e}")));
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Watch loop for a project whose graph came from a SCIP index.
+///
+/// Deliberately does not rebuild anything. A Tree-sitter re-parse would
+/// downgrade the graph, and a scip-java run is a multi-minute Gradle build
+/// that nobody asked this command to start.
+async fn watch_scip_project(resolved_path: &Path, indexes: &[String]) -> Result<()> {
+    let graph = load_or_index_graph(resolved_path)?;
+    println!(
+        "{} SCIP graph: {} nodes, {} edges (from {})",
+        "✓".green(),
+        graph.node_count(),
+        graph.edge_count(),
+        indexes.join(", ")
+    );
+    println!(
+        "  {}",
+        "Watching for source changes. Arbor will not re-parse — that would".dimmed()
+    );
+    println!(
+        "  {}",
+        "replace compiler-resolved edges with guesses.".dimmed()
+    );
+    println!();
+
+    let baseline = newest_source_mtime(resolved_path);
+    let mut warned = false;
+
+    loop {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let current = newest_source_mtime(resolved_path);
+        // Warn once. A per-keystroke reminder would be noise, and nothing
+        // changes between the first edit and the rebuild.
+        if current > baseline && !warned {
+            warned = true;
+            println!("{} Sources changed — the graph is now stale.", "⚠".yellow());
+            println!(
+                "  Refresh in the background: {}",
+                "arbor scip --background".cyan()
+            );
+            println!(
+                "  Or synchronously:          {}",
+                format!("arbor scip {} --root .", indexes.join(" ")).cyan()
+            );
+            println!(
+                "  Poll a background run:     {}",
+                "arbor scip --task-status".cyan()
+            );
+            println!();
+        }
+
+        // A completed rebuild resets the warning, so the next edit warns again.
+        if warned {
+            if let Some(task) = arbor_graph::ScipTask::load(resolved_path) {
+                if task.status == arbor_graph::ScipTaskStatus::Completed
+                    && task.updated_at as i64 >= current
+                {
+                    println!(
+                        "{} Graph refreshed: {} nodes, {} edges",
+                        "✓".green(),
+                        task.node_count.unwrap_or(0),
+                        task.edge_count.unwrap_or(0)
+                    );
+                    warned = false;
+                }
+            }
+        }
+    }
+}
+
+/// Newest mtime among source files, as whole seconds.
+fn newest_source_mtime(root: &Path) -> i64 {
+    let cache_mtime = cache_mtime_secs(&graph_binary_path(root)).unwrap_or(0);
+    match arbor_watcher::sources_newer_than(root, cache_mtime, false) {
+        true => cache_mtime as i64 + 1,
+        false => cache_mtime as i64,
+    }
+}
+
+/// Every non-empty `index.scip` under a project root.
+///
+/// Skips the empty files a failed build leaves behind, and passes every module
+/// in one call — a symbol defined in module B is only linkable while B's
+/// definitions are in scope.
+fn discover_scip_indexes(project_root: &Path) -> Result<Vec<PathBuf>> {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if path.is_dir() {
+                if name != ".git" && name != ".arbor" && name != "node_modules" {
+                    walk(&path, out);
+                }
+            } else if name == "index.scip" {
+                if let Ok(meta) = entry.metadata() {
+                    if meta.len() > 0 {
+                        out.push(path);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    walk(project_root, &mut out);
+    out.sort();
+    Ok(out)
+}
+
+/// The ingest proper, shared by the foreground command and the worker.
+fn scip_ingest_at(
+    resolved_path: &Path,
+    indexes: &[PathBuf],
+    merge: bool,
+    no_dispatch: bool,
+    json_output: bool,
+) -> Result<()> {
+    // Fail on a missing index before doing any work: a typo'd path is the
+    // most likely mistake here, and a decode error deep in the run reads as
+    // a bug in Arbor rather than a bug in the command line.
+    for index in indexes {
+        if !index.is_file() {
+            return Err(format!("SCIP index not found: {}", index.display()).into());
+        }
+    }
+
+    if !json_output {
+        println!("{}", "Ingesting SCIP index...".cyan());
+    }
+
+    let options = match no_dispatch {
+        true => arbor_scip::IngestOptions::new(resolved_path).without_dispatch_expansion(),
+        false => arbor_scip::IngestOptions::new(resolved_path),
+    };
+
+    let arbor_scip::ScipIngest {
+        nodes,
+        edges,
+        stats,
+    } = arbor_scip::ingest_files(indexes, &options)?;
+
+    let covered_files: std::collections::BTreeSet<String> =
+        nodes.iter().map(|node| node.file.clone()).collect();
+    let pinned_total = edges.len();
+
+    let (mut graph, dropped_edges) = match merge {
+        true => build_merged_scip_graph(resolved_path, nodes, edges, &covered_files)?,
+        false => build_scip_only_graph(nodes, edges),
+    };
+
+    let scores = compute_centrality(&graph, 20, 0.85);
+    graph.set_centrality_scores(scores);
+
+    save_graph_snapshot(resolved_path, &graph)?;
+    save_graph_binary(resolved_path, &graph)?;
+    write_scip_provenance(resolved_path, indexes, merge)?;
+
+    match json_output {
+        true => print_scip_json(&graph, &stats, &covered_files, pinned_total, dropped_edges)?,
+        false => print_scip_summary(&graph, &stats, &covered_files, pinned_total, dropped_edges),
+    }
+
+    Ok(())
+}
+
+/// Builds a graph containing only what the SCIP index described.
+fn build_scip_only_graph(
+    nodes: Vec<arbor_core::CodeNode>,
+    edges: Vec<arbor_graph::PinnedEdge>,
+) -> (arbor_graph::ArborGraph, usize) {
+    let mut builder = arbor_graph::GraphBuilder::new();
+    builder.add_nodes(nodes);
+    builder.add_pinned_edges(edges);
+
+    // SCIP nodes carry no `references`, so there is nothing for name-based
+    // resolution to do — and letting it run would be the one thing that could
+    // reintroduce guessed edges into an otherwise exact graph.
+    let graph = builder.build_without_resolve();
+    let dropped = 0;
+
+    (graph, dropped)
+}
+
+/// Builds a graph where SCIP covers the JVM sources and Tree-sitter covers the rest.
+///
+/// Order matters: the Tree-sitter index runs first and in full, so its
+/// import-aware resolution sees every file it would normally see. Only then
+/// are the SCIP-covered files removed and replaced. Doing it the other way
+/// round — retaining nodes from a previous graph — would lose the per-file
+/// import map, which is what keeps Tree-sitter's cross-module edges honest.
+fn build_merged_scip_graph(
+    project_root: &Path,
+    scip_nodes: Vec<arbor_core::CodeNode>,
+    scip_edges: Vec<arbor_graph::PinnedEdge>,
+    covered_files: &std::collections::BTreeSet<String>,
+) -> Result<(arbor_graph::ArborGraph, usize)> {
+    let options = IndexOptions {
+        follow_symlinks: false,
+        cache_path: Some(project_root.join(".arbor").join("cache")),
+    };
+    let mut graph = index_directory(project_root, options)?.graph;
+
+    for file in covered_files {
+        graph.remove_file(file);
+    }
+
+    for node in scip_nodes {
+        graph.add_node(node);
+    }
+
+    let dropped = graph.add_pinned_edges(scip_edges);
+
+    Ok((graph, dropped))
+}
+
+fn print_scip_summary(
+    graph: &arbor_graph::ArborGraph,
+    stats: &arbor_scip::ScipStats,
+    covered_files: &std::collections::BTreeSet<String>,
+    pinned_total: usize,
+    dropped_edges: usize,
+) {
+    let tool = match stats.tools.is_empty() {
+        true => "unknown indexer".to_string(),
+        false => stats.tools.join(", "),
+    };
+
+    println!(
+        "{} Ingested {} documents from {} ({})",
+        "✓".green(),
+        stats.documents.to_string().cyan(),
+        tool,
+        stats.languages.join(", ")
+    );
+    println!(
+        "  {} definitions across {} files",
+        stats.definitions.to_string().cyan(),
+        covered_files.len().to_string().cyan()
+    );
+    println!(
+        "  {} references resolved, {} external (JDK, jars, packages), {} unattributed",
+        stats.references_resolved.to_string().cyan(),
+        stats.references_external.to_string().dimmed(),
+        stats.references_unattributed.to_string().dimmed()
+    );
+    println!(
+        "  {} references ignored (locals, params, type params), {} self/recursive, {} unreadable",
+        stats.references_ignored.to_string().dimmed(),
+        stats.references_self.to_string().dimmed(),
+        stats.references_without_range.to_string().dimmed()
+    );
+    println!(
+        "  {} implements/override edges, {} added by dispatch expansion",
+        stats.implements_edges.to_string().cyan(),
+        stats.dispatch_edges.to_string().cyan()
+    );
+    println!(
+        "{} Graph: {} nodes, {} edges ({} confident)",
+        "✓".green(),
+        graph.node_count().to_string().cyan(),
+        graph.edge_count().to_string().cyan(),
+        graph.confident_edge_count().to_string().cyan()
+    );
+
+    if stats.definitions == 0 {
+        eprintln!(
+            "\n{} The index contained no definitions Arbor can use. Check that the \
+             indexer actually compiled sources (an empty build produces an empty index).",
+            "⚠ Warning:".yellow()
+        );
+    }
+
+    // Body extents are what make enclosing-symbol attribution exact. Without
+    // them the caller of each edge is a nearest-preceding-definition guess,
+    // and the user deserves to know which kind of graph they are holding.
+    if stats.documents_without_body_extents > 0 {
+        eprintln!(
+            "\n{} {} of {} documents carried no enclosing ranges; callers in those \
+             files were attributed by position, not by the indexer.",
+            "⚠ Warning:".yellow(),
+            stats.documents_without_body_extents,
+            stats.documents
+        );
+    }
+
+    if dropped_edges > 0 {
+        eprintln!(
+            "\n{} {} of {} exact edges were dropped because an endpoint is not in \
+             the graph. Re-running without --merge, or passing every module's index, \
+             usually resolves this.",
+            "⚠ Warning:".yellow(),
+            dropped_edges,
+            pinned_total
+        );
+    }
+}
+
+fn print_scip_json(
+    graph: &arbor_graph::ArborGraph,
+    stats: &arbor_scip::ScipStats,
+    covered_files: &std::collections::BTreeSet<String>,
+    pinned_total: usize,
+    dropped_edges: usize,
+) -> Result<()> {
+    let payload = serde_json::json!({
+        "indexer": stats.tools,
+        "languages": stats.languages,
+        "documents": stats.documents,
+        "filesCovered": covered_files.len(),
+        "definitions": stats.definitions,
+        "referencesResolved": stats.references_resolved,
+        "referencesExternal": stats.references_external,
+        "referencesIgnored": stats.references_ignored,
+        "referencesWithoutRange": stats.references_without_range,
+        "referencesSelf": stats.references_self,
+        "referencesUnattributed": stats.references_unattributed,
+        "implementsEdges": stats.implements_edges,
+        "dispatchEdges": stats.dispatch_edges,
+        "documentsWithoutBodyExtents": stats.documents_without_body_extents,
+        "exactEdges": pinned_total,
+        "exactEdgesDropped": dropped_edges,
+        "graph": {
+            "nodeCount": graph.node_count(),
+            "edgeCount": graph.edge_count(),
+            "confidentEdgeCount": graph.confident_edge_count(),
+        }
+    });
+
+    println!("{}", serde_json::to_string_pretty(&payload)?);
 
     Ok(())
 }
@@ -1106,6 +2065,7 @@ fn index_changed_only(path: &Path, output: Option<&Path>, follow_symlinks: bool)
 
     save_graph_snapshot(path, &graph)?;
     save_graph_binary(path, &graph)?;
+    clear_scip_provenance(path);
 
     if let Some(out_path) = output {
         export_graph(&graph, out_path)?;
@@ -1365,18 +2325,17 @@ pub async fn serve(port: u16, headless: bool, path: &Path, follow_symlinks: bool
         follow_symlinks,
         cache_path: None,
     };
-    let result = index_directory(&resolved_path, options)?;
-    let mut graph = result.graph;
+    let mut graph = graph_for_serving(&resolved_path, options)?;
 
     // Compute centrality
     let scores = compute_centrality(&graph, 20, 0.85);
     graph.set_centrality_scores(scores);
 
     println!(
-        "{} Indexed {} files ({} nodes)",
+        "{} Serving {} nodes, {} edges",
         "✓".green(),
-        result.files_indexed,
-        result.nodes_extracted
+        graph.node_count(),
+        graph.edge_count()
     );
 
     let addr = format!("{}:{}", bind_addr, port).parse()?;
@@ -1405,8 +2364,7 @@ pub async fn viz(path: &Path, follow_symlinks: bool) -> Result<()> {
         follow_symlinks,
         cache_path: None,
     };
-    let result = index_directory(&resolved_path, options)?;
-    let mut graph = result.graph;
+    let mut graph = graph_for_serving(&resolved_path, options)?;
 
     // Compute centrality for better initial layout
     println!("Computing centrality...");
@@ -1414,10 +2372,10 @@ pub async fn viz(path: &Path, follow_symlinks: bool) -> Result<()> {
     graph.set_centrality_scores(scores);
 
     println!(
-        "{} Indexed {} files ({} nodes)",
+        "{} Visualizing {} nodes ({} edges)",
         "✓".green(),
-        result.files_indexed,
-        result.nodes_extracted
+        graph.node_count(),
+        graph.edge_count()
     );
 
     // 2. Start API Server (JSON-RPC)
@@ -1548,8 +2506,10 @@ pub async fn viz(path: &Path, follow_symlinks: bool) -> Result<()> {
 pub fn export(path: &Path, output: &Path) -> Result<()> {
     let resolved_path = resolve_project_path(path)?;
     let _ = ensure_arbor_initialized(&resolved_path)?;
-    let result = index_directory(&resolved_path, IndexOptions::default())?;
-    export_graph(&result.graph, output)?;
+    // Reads the cached graph, so exporting a SCIP project yields its exact
+    // edges rather than a freshly-guessed Tree-sitter set.
+    let graph = load_or_index_graph(&resolved_path)?;
+    export_graph(&graph, output)?;
     Ok(())
 }
 
@@ -1565,18 +2525,18 @@ pub fn status(path: &Path, show_files: bool) -> Result<()> {
         );
     }
 
-    // Quick index to get stats
-    let result = index_directory(&resolved_path, IndexOptions::default())?;
+    // Report on the cached graph. Re-indexing here would print Tree-sitter
+    // counts for a project whose graph came from the compiler.
+    let graph = load_or_index_graph(&resolved_path)?;
 
     // Collect unique files from indexed nodes
-    let files: std::collections::HashSet<_> =
-        result.graph.nodes().map(|n| n.file.clone()).collect();
+    let files: std::collections::HashSet<_> = graph.nodes().map(|n| n.file.clone()).collect();
 
     // Collect unique extensions from indexed files
     let mut file_exts: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut ext_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
 
-    for node in result.graph.nodes() {
+    for node in graph.nodes() {
         if file_exts.insert(node.file.clone()) {
             if let Some(ext) = std::path::Path::new(&node.file)
                 .extension()
@@ -1592,10 +2552,17 @@ pub fn status(path: &Path, show_files: bool) -> Result<()> {
     ext_list.sort_by(|a, b| b.1.cmp(a.1));
 
     println!("{}", "📊 Arbor Status".cyan().bold());
+    if let Some(indexes) = scip_provenance_indexes(&resolved_path) {
+        println!(
+            "  {} {}",
+            "Source:".dimmed(),
+            format!("SCIP index ({})", indexes.join(", ")).cyan()
+        );
+    }
     println!();
-    println!("  {} {}", "Files indexed:".dimmed(), result.files_indexed);
-    println!("  {} {}", "Nodes:".dimmed(), result.nodes_extracted);
-    println!("  {} {}", "Edges:".dimmed(), result.graph.edge_count());
+    println!("  {} {}", "Files indexed:".dimmed(), files.len());
+    println!("  {} {}", "Nodes:".dimmed(), graph.node_count());
+    println!("  {} {}", "Edges:".dimmed(), graph.edge_count());
 
     if show_files {
         println!();
@@ -1640,7 +2607,7 @@ pub fn status(path: &Path, show_files: bool) -> Result<()> {
     }
 
     // Show helpful tip if graph is empty
-    if result.nodes_extracted == 0 && result.files_indexed > 0 {
+    if graph.node_count() == 0 && !files.is_empty() {
         println!();
         println!(
             "{} Files were scanned but no code nodes extracted.",
@@ -1678,12 +2645,53 @@ pub async fn bridge(
         follow_symlinks,
         cache_path: Some(resolved_path.join(".arbor").join("cache")),
     };
-    eprintln!("{} Starting initial index (background)...", "⏳".yellow());
+    // Announced accurately: on a SCIP project nothing is indexed here, the
+    // compiler-resolved cache is loaded, and saying "indexing" would suggest
+    // the graph is being rebuilt from source.
+    match scip_provenance_indexes(&resolved_path).is_some() {
+        true => eprintln!(
+            "{} Loading the SCIP graph from cache (background)...",
+            "⏳".yellow()
+        ),
+        false => eprintln!("{} Starting initial index (background)...", "⏳".yellow()),
+    }
+
+    // A SCIP-provenanced project must not be re-indexed here: agents would be
+    // handed guessed edges over MCP while the cache on disk holds exact ones,
+    // and `cache_path` is set so the Tree-sitter result would also land in the
+    // sled store for later readers to pick up.
+    let scip_provenanced = scip_provenance_indexes(&resolved_path).is_some();
 
     let index_graph = shared_graph.clone();
     tokio::spawn(async move {
-        let result =
-            tokio::task::spawn_blocking(move || index_directory(&index_path, options)).await;
+        let result = match scip_provenanced {
+            true => {
+                tokio::task::spawn_blocking(move || {
+                    load_graph_binary(&index_path)
+                        .or_else(|_| load_graph_snapshot(&index_path))
+                        .map(|graph| arbor_watcher::IndexResult {
+                            // Distinct files in the loaded graph, so the
+                            // readiness line does not report "0 files" for a
+                            // fully populated graph.
+                            files_indexed: graph
+                                .nodes()
+                                .map(|n| n.file.as_str())
+                                .collect::<std::collections::HashSet<_>>()
+                                .len(),
+                            nodes_extracted: graph.node_count(),
+                            duration_ms: 0,
+                            cache_hits: 0,
+                            errors: Vec::new(),
+                            graph,
+                        })
+                        .map_err(|e| std::io::Error::other(e.to_string()))
+                })
+                .await
+            }
+            false => {
+                tokio::task::spawn_blocking(move || index_directory(&index_path, options)).await
+            }
+        };
         match result {
             Ok(Ok(index_result)) => {
                 let mut guard = index_graph.write().await;
@@ -2929,6 +3937,14 @@ pub async fn watch(path: &Path) -> Result<()> {
     println!("{}", "👁️  Watch Mode".cyan().bold());
     println!("Watching: {}", resolved_path.display());
     println!("Press Ctrl+C to stop.\n");
+
+    // On a SCIP project, watch must not present Tree-sitter data as the graph.
+    // It cannot refresh either: refreshing means re-running the compiler, which
+    // is a full build rather than a re-parse. So it watches, reports staleness
+    // once, and names the command that fixes it.
+    if let Some(indexes) = scip_provenance_indexes(&resolved_path) {
+        return watch_scip_project(&resolved_path, &indexes).await;
+    }
 
     // Initial index
     let mut last_result = index_directory(&resolved_path, IndexOptions::default())?;

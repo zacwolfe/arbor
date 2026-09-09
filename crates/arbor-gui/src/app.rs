@@ -78,6 +78,45 @@ impl ArborApp {
         }
     }
 
+    /// Obtains a graph to work from.
+    ///
+    /// A project whose graph came from a SCIP index must not be re-parsed with
+    /// Tree-sitter: it cannot resolve `obj.method()`, so the GUI would show a
+    /// materially different graph from the CLI on the same repository — far
+    /// fewer edges, and methods with hundreds of callers displayed as uncalled.
+    /// The cached compiler-resolved graph wins in that case.
+    fn load_graph(&mut self) -> Result<String, String> {
+        if arbor_graph::cache::is_scip_provenanced(&self.cwd) {
+            return match arbor_graph::cache::load_any(&self.cwd) {
+                Some(graph) => {
+                    let summary = format!(
+                        "Loaded SCIP graph: {} nodes, {} edges.",
+                        graph.node_count(),
+                        graph.edge_count()
+                    );
+                    self.graph = Some(graph);
+                    Ok(summary)
+                }
+                // Refreshing a SCIP graph means re-running the compiler, which
+                // is not something a GUI button should start.
+                None => Err(
+                    "This project uses a SCIP index but its cache is missing.                      Run `arbor scip --background` and reopen."
+                        .to_string(),
+                ),
+            };
+        }
+
+        self.status = "Indexing codebase...".to_string();
+        match index_directory(&self.cwd, IndexOptions::default()) {
+            Ok(result) => {
+                let summary = format!("Indexed {} nodes.", result.nodes_extracted);
+                self.graph = Some(result.graph);
+                Ok(summary)
+            }
+            Err(e) => Err(format!("Indexing failed: {}", e)),
+        }
+    }
+
     fn analyze(&mut self) {
         if self.symbol_input.trim().is_empty() {
             self.status = "Please enter a symbol name.".to_string();
@@ -86,14 +125,10 @@ impl ArborApp {
 
         // Index if not already done
         if self.graph.is_none() {
-            self.status = "Indexing codebase...".to_string();
-            match index_directory(&self.cwd, IndexOptions::default()) {
-                Ok(result) => {
-                    self.graph = Some(result.graph);
-                    self.status = format!("Indexed {} nodes.", result.nodes_extracted);
-                }
+            match self.load_graph() {
+                Ok(status) => self.status = status,
                 Err(e) => {
-                    self.status = format!("Indexing failed: {}", e);
+                    self.status = e;
                     return;
                 }
             }

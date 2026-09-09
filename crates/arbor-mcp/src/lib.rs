@@ -329,14 +329,24 @@ impl McpServer {
                 data: None,
             })?;
 
-        self.tasks
-            .get_response(task_id)
-            .await
-            .ok_or_else(|| JsonRpcError {
-                code: -32602,
-                message: format!("Task not found: {}", task_id),
-                data: None,
-            })
+        if let Some(response) = self.tasks.get_response(task_id).await {
+            return Ok(response);
+        }
+
+        // A detached `arbor scip --background` rebuild runs in a different
+        // process, so it cannot register with this in-memory manager. Its
+        // handle is on disk instead, which is what makes it pollable here.
+        if let Some(task) = arbor_graph::ScipTask::load(&self.project_root) {
+            if task.id == task_id {
+                return Ok(task.to_task_response());
+            }
+        }
+
+        Err(JsonRpcError {
+            code: -32602,
+            message: format!("Task not found: {}", task_id),
+            data: None,
+        })
     }
 
     async fn tasks_update(&self, params: Value) -> Result<Value, JsonRpcError> {

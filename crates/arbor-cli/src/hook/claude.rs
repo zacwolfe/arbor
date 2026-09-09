@@ -26,6 +26,11 @@ const PERMISSIONS: &[&str] = &[
     "Bash(arbor entry-points *)",
     "Bash(arbor refactor *)",
     "Bash(arbor export *)",
+    "Bash(arbor status *)",
+    // Polling a rebuild is read-only. Deliberately NOT `arbor scip *`: that
+    // would let an agent kick off a multi-minute Gradle build unprompted.
+    "Bash(arbor scip --task-status *)",
+    "Bash(arbor scip --task-status)",
 ];
 
 pub struct Claude;
@@ -202,6 +207,18 @@ When `arbor query` returns test files but you need production code, do NOT fall 
 2. Run `arbor callers "symbol" .` to trace upstream into production code
 3. Or run `arbor file-graph "src/main/..." .` if you already know the production file path
 
+### If this project uses a SCIP index (JVM: Java, Kotlin, Scala)
+
+`arbor status .` prints `Source: SCIP index (...)` when it does. On such a project the graph comes from the compiler, not from Tree-sitter, so `obj.method()` calls and interface implementations are real edges rather than absent ones.
+
+Three rules follow:
+
+1. **Never run `arbor index`.** It is refused on these projects, because Tree-sitter cannot resolve method calls and would replace exact edges with guesses. The refusal mentions `--force`; do NOT use it.
+2. **Refreshing requires a compile, so it is the human's call.** If a query looks stale, say so and suggest they run `arbor scip --background`. Do not run it yourself — it starts a multi-minute Gradle build.
+3. **A rebuild in flight is pollable**: `arbor scip --task-status` is read-only and safe to run.
+
+If a read command prints `Java sources changed ... rebuilding now`, it is compiling before answering. Let it finish rather than interrupting.
+
 "#;
 
 // ---------------------------------------------------------------------------
@@ -261,10 +278,17 @@ echo 'BLOCK: Use arbor query \"pattern\" . to find files/symbols. \
 Use arbor file-graph for file contents.' && exit 1; exit 0"
         .to_string();
     // PostToolUse: inject the project skeleton once per day.
+    // ARBOR_NO_AUTO_REBUILD is essential here, not incidental. On a project
+    // whose graph came from a SCIP index, a read command with stale sources
+    // rebuilds synchronously — which for a JVM repo means a full compile. That
+    // would stall the agent's first tool call of the day for minutes inside a
+    // hook, with `2>/dev/null` hiding any explanation. The skeleton is worth
+    // having fast and slightly stale; it is not worth blocking on.
     let map = "FLAG=\".arbor/.map-injected-$(date +%Y%m%d)\"; \
 [ -f \"$FLAG\" ] && exit 0; touch \"$FLAG\"; \
 echo '--- arbor map (project skeleton) ---'; \
-arbor map . --exclude-test 2>/dev/null; echo '--- end arbor map ---'; exit 0"
+ARBOR_NO_AUTO_REBUILD=1 arbor map . --exclude-test 2>/dev/null; \
+echo '--- end arbor map ---'; exit 0"
         .to_string();
     (init, block, map)
 }
@@ -377,4 +401,95 @@ fn ensure_permissions(settings: &mut Value) -> bool {
         }
     }
     changed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The regression that matters most here: this hook fires on the agent's
+    /// first Bash call of the day. Without the opt-out, a JVM project with a
+    /// stale SCIP index would compile — for minutes — inside the hook, with
+    /// `2>/dev/null` hiding every clue as to why nothing was happening.
+    #[test]
+    fn the_map_hook_never_triggers_an_auto_rebuild() {
+        let (_, _, map) = arbor_hook_commands();
+        assert!(
+            map.contains("ARBOR_NO_AUTO_REBUILD=1 arbor map"),
+            "map hook must disable auto-rebuild: {map}"
+        );
+    }
+
+    #[test]
+    fn the_init_hook_only_initialises_and_never_indexes() {
+        // `arbor init` just creates .arbor/; `arbor index` would be refused on
+        // a SCIP project and would downgrade the graph elsewhere.
+        let (init, _, _) = arbor_hook_commands();
+        assert!(init.contains("arbor init ."));
+        assert!(
+            !init.contains("arbor index"),
+            "the init hook must not index: {init}"
+        );
+    }
+
+    #[test]
+    fn no_injected_hook_can_rebuild_the_graph() {
+        let (init, block, map) = arbor_hook_commands();
+        for (name, cmd) in [("init", &init), ("block", &block), ("map", &map)] {
+            assert!(
+                !cmd.contains("arbor scip"),
+                "{name} hook must not start a rebuild: {cmd}"
+            );
+            assert!(
+                !cmd.contains("arbor index"),
+                "{name} hook must not re-index: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn permissions_allow_polling_a_rebuild_but_not_starting_one() {
+        assert!(PERMISSIONS.iter().any(|p| p.contains("--task-status")));
+        assert!(
+            !PERMISSIONS.contains(&"Bash(arbor scip *)"),
+            "a blanket scip allow-list would let an agent start Gradle builds unprompted"
+        );
+        assert!(
+            !PERMISSIONS.iter().any(|p| p.contains("arbor index")),
+            "indexing is never agent-initiated"
+        );
+    }
+
+    #[test]
+    fn permissions_are_all_well_formed_bash_patterns() {
+        for p in PERMISSIONS {
+            assert!(p.starts_with("Bash(arbor "), "malformed: {p}");
+            assert!(p.ends_with(')'), "malformed: {p}");
+        }
+    }
+
+    #[test]
+    fn guidance_tells_the_agent_not_to_index_a_scip_project() {
+        let block = directives_block();
+        assert!(block.contains("SCIP index"), "guidance must cover SCIP");
+        assert!(block.contains("Never run `arbor index`"));
+        assert!(
+            block.contains("arbor scip --background"),
+            "guidance must name the refresh command for the human"
+        );
+        assert!(
+            block.contains("--task-status"),
+            "guidance must say how to poll a running rebuild"
+        );
+    }
+
+    #[test]
+    fn guidance_block_is_wrapped_in_the_idempotency_markers() {
+        let block = directives_block();
+        assert!(block.contains(BEGIN_MARKER));
+        assert!(block.contains(END_MARKER));
+        // Re-running `arbor hook claude` must replace, not append.
+        let twice = upsert_block(&block, &block);
+        assert_eq!(twice.matches(BEGIN_MARKER).count(), 1);
+    }
 }
