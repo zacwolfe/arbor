@@ -29,6 +29,10 @@ pub struct Indexer {
     /// whatever it is called.
     pub markers: &'static [&'static str],
 
+    /// Source extensions this indexer covers, used only as a last resort when
+    /// no marker anywhere matched.
+    pub extensions: &'static [&'static str],
+
     /// Arguments that produce an index in the current directory.
     pub args: &'static [&'static str],
 
@@ -59,6 +63,7 @@ pub const INDEXERS: &[Indexer] = &[
         binary: "scip-java",
         language: "Java/Kotlin",
         markers: &["build.gradle", "build.gradle.kts", "pom.xml"],
+        extensions: &["java", "kt", "kts"],
         args: &["index"],
         dynamic_args: None,
         install: "coursier bootstrap --standalone -o scip-java \
@@ -69,6 +74,7 @@ org.scip-code:scip-java:0.13.1 --main org.scip_code.scip_java.ScipJava",
         binary: "rust-analyzer",
         language: "Rust",
         markers: &["Cargo.toml"],
+        extensions: &["rs"],
         args: &["scip", "."],
         dynamic_args: None,
         install: "rustup component add rust-analyzer",
@@ -78,6 +84,7 @@ org.scip-code:scip-java:0.13.1 --main org.scip_code.scip_java.ScipJava",
         binary: "scip-typescript",
         language: "TypeScript/JavaScript",
         markers: &["tsconfig.json"],
+        extensions: &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"],
         args: &["index"],
         dynamic_args: None,
         install: "npm install -g @sourcegraph/scip-typescript",
@@ -86,7 +93,16 @@ org.scip-code:scip-java:0.13.1 --main org.scip_code.scip_java.ScipJava",
     Indexer {
         binary: "scip-python",
         language: "Python",
-        markers: &["pyproject.toml", "setup.py", "requirements.txt"],
+        markers: &[
+            "pyproject.toml",
+            "setup.py",
+            "setup.cfg",
+            "requirements.txt",
+            "Pipfile",
+            "poetry.lock",
+            ".python-version",
+        ],
+        extensions: &["py", "pyi"],
         args: &["index", "."],
         // Required by scip-python, with no default. The directory name is the
         // same thing a human would type.
@@ -98,6 +114,7 @@ org.scip-code:scip-java:0.13.1 --main org.scip_code.scip_java.ScipJava",
         binary: "scip-go",
         language: "Go",
         markers: &["go.mod"],
+        extensions: &["go"],
         args: &[],
         dynamic_args: None,
         install: "go install github.com/scip-code/scip-go/cmd/scip-go@latest",
@@ -107,6 +124,7 @@ org.scip-code:scip-java:0.13.1 --main org.scip_code.scip_java.ScipJava",
         binary: "scip-dotnet",
         language: "C#",
         markers: &["*.sln", "*.csproj"],
+        extensions: &["cs"],
         args: &["index"],
         dynamic_args: None,
         install: "dotnet tool install --global scip-dotnet",
@@ -119,6 +137,7 @@ org.scip-code:scip-java:0.13.1 --main org.scip_code.scip_java.ScipJava",
         // scip-clang cannot run without one, so matching on the build script
         // would promise an index Arbor cannot deliver.
         markers: &["compile_commands.json"],
+        extensions: &[],
         args: &["--compdb-path=compile_commands.json"],
         dynamic_args: None,
         install: "download a release from https://github.com/sourcegraph/scip-clang/releases",
@@ -128,6 +147,7 @@ org.scip-code:scip-java:0.13.1 --main org.scip_code.scip_java.ScipJava",
         binary: "scip-ruby",
         language: "Ruby",
         markers: &["Gemfile"],
+        extensions: &["rb"],
         args: &["."],
         dynamic_args: None,
         install: "add gem 'scip-ruby' to your Gemfile's development group",
@@ -137,6 +157,7 @@ org.scip-code:scip-java:0.13.1 --main org.scip_code.scip_java.ScipJava",
         binary: "scip-php",
         language: "PHP",
         markers: &["composer.json"],
+        extensions: &["php"],
         args: &[],
         dynamic_args: None,
         install: "composer require --dev davidrjenni/scip-php",
@@ -146,6 +167,7 @@ org.scip-code:scip-java:0.13.1 --main org.scip_code.scip_java.ScipJava",
         binary: "scip-dart",
         language: "Dart",
         markers: &["pubspec.yaml"],
+        extensions: &["dart"],
         args: &["."],
         dynamic_args: None,
         install: "dart pub global activate scip_dart",
@@ -204,11 +226,59 @@ fn marker_present(project_root: &Path, marker: &str) -> bool {
 }
 
 /// Every indexer whose markers are present, whether or not it is installed.
+///
+/// Falls back to the source files at the root when no marker matches at all.
+/// Plenty of real projects are a directory of scripts with no manifest — a
+/// pyenv-managed Python repo with only `.py` files is the common case — and
+/// refusing those would be pedantry rather than caution. The fallback runs
+/// *only* when nothing else matched, so it can never add a spurious indexer
+/// alongside a correctly detected one.
 pub fn detect(project_root: &Path) -> Vec<&'static Indexer> {
-    INDEXERS
+    let by_marker: Vec<&'static Indexer> = INDEXERS
         .iter()
         .filter(|indexer| indexer.applies_to(project_root))
+        .collect();
+
+    if !by_marker.is_empty() {
+        return by_marker;
+    }
+
+    let extensions = root_extensions(project_root);
+    INDEXERS
+        .iter()
+        .filter(|indexer| {
+            indexer
+                .extensions
+                .iter()
+                .any(|ext| extensions.iter().any(|found| found == ext))
+        })
         .collect()
+}
+
+/// Extensions of the files directly inside the project root.
+///
+/// Root-only, like the markers, and for the same reason: a repository's own
+/// language is visible at its top level, while walking the tree would find every
+/// vendored fixture and test asset.
+fn root_extensions(project_root: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(project_root) else {
+        return Vec::new();
+    };
+
+    let mut extensions: Vec<String> = entries
+        .flatten()
+        .filter(|entry| entry.path().is_file())
+        .filter_map(|entry| {
+            entry
+                .path()
+                .extension()
+                .map(|ext| ext.to_string_lossy().to_lowercase())
+        })
+        .collect();
+
+    extensions.sort();
+    extensions.dedup();
+    extensions
 }
 
 /// Looks an indexer up by binary name.
@@ -326,6 +396,40 @@ mod tests {
             vec!["index", ".", "--project-name", "my-service"],
             "scip-python refuses to run without --project-name"
         );
+    }
+
+    #[test]
+    fn a_pyenv_project_with_no_manifest_is_detected() {
+        // zep_config's shape: 80 .py files, no pyproject.toml, no requirements
+        // — only pyenv's .python-version.
+        let dir = project(&[".python-version", "billing.py", "retrieval.py"]);
+        let found: Vec<&str> = detect(dir.path()).iter().map(|i| i.binary).collect();
+        assert_eq!(found, vec!["scip-python"]);
+    }
+
+    #[test]
+    fn source_files_alone_are_enough_when_nothing_else_matches() {
+        // A bare directory of scripts, not even a .python-version.
+        let dir = project(&["one.py", "two.py", "notes.md"]);
+        let found: Vec<&str> = detect(dir.path()).iter().map(|i| i.binary).collect();
+        assert_eq!(found, vec!["scip-python"]);
+    }
+
+    #[test]
+    fn the_extension_fallback_never_fires_alongside_a_marker() {
+        // A Rust project with a helper script at the root must not also try to
+        // index Python: Cargo.toml already answered the question.
+        let dir = project(&["Cargo.toml", "release.py"]);
+        let found: Vec<&str> = detect(dir.path()).iter().map(|i| i.binary).collect();
+        assert_eq!(found, vec!["rust-analyzer"]);
+    }
+
+    #[test]
+    fn c_source_alone_is_not_enough() {
+        // scip-clang cannot run without a compilation database, so a .cpp at the
+        // root must not promise an index it cannot deliver.
+        let dir = project(&["main.cpp", "util.h"]);
+        assert!(detect(dir.path()).is_empty());
     }
 
     #[test]

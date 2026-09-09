@@ -64,9 +64,19 @@ arbor scip --background .      # detached; poll with: arbor scip --task-status
 ```
 
 Detection is by root marker — `build.gradle`/`pom.xml` → `scip-java`,
-`Cargo.toml` → `rust-analyzer`, `tsconfig.json` → `scip-typescript`, and so on.
+`Cargo.toml` → `rust-analyzer`, `tsconfig.json` → `scip-typescript`,
+`pyproject.toml`/`requirements.txt`/`.python-version` → `scip-python`, and so on.
 The table lives in `crates/arbor-cli/src/indexers.rs`; adding a language is one
 row.
+
+**No manifest?** If no marker matches anywhere, Arbor falls back to the source
+extensions of the files at the root, so a directory of `.py` scripts with no
+`pyproject.toml` still indexes. The fallback runs only when nothing else matched,
+so it can never add a spurious indexer next to a correctly detected one — a Rust
+project with a `release.py` at the root runs `rust-analyzer` and nothing else.
+`scip-clang` is excluded from it deliberately: it cannot run without a
+compilation database, so a `.cpp` at the root would promise an index Arbor cannot
+deliver.
 
 **A polyglot repository runs every indexer that matches.** A root with both
 `Cargo.toml` and `tsconfig.json` runs `rust-analyzer` and `scip-typescript`,
