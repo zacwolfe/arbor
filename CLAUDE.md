@@ -171,7 +171,21 @@ All query commands support `--json`. `map` additionally supports `--tokens N`, `
 
 ## Agent Integration (Claude Code)
 
-To integrate arbor into a target project for AI agent use:
+To integrate arbor into a target project for AI agent use.
+
+**Steps 2–4 are automated:** `arbor hook claude` (add `--global` for the user
+config) writes the hooks, the permission allow-list, and the CLAUDE.md guidance
+block. It merges rather than overwrites — existing hooks, permissions, `deny`
+entries, `env`, and CLAUDE.md content are preserved — and re-running updates the
+arbor block in place. It prefers an existing `.claude/CLAUDE.md` if there is one,
+otherwise creates `./CLAUDE.md`.
+
+Step 1 is **not** automated: `.mcp.json` must still be written by hand, because
+the MCP server entry needs an absolute path to both the `arbor` binary and the
+project.
+
+The manual equivalents are documented below so the generated config is
+reviewable.
 
 ### 1. MCP server (`.mcp.json` at project root)
 
@@ -228,15 +242,23 @@ To integrate arbor into a target project for AI agent use:
 
 `arbor hook claude` also allow-lists `arbor scip --task-status` (read-only) but deliberately **not** `arbor scip *`, since that would let an agent start a multi-minute Gradle build unprompted, and its injected guidance tells the agent never to run `arbor index` on a SCIP project.
 
-### 3. Permissions (`.claude/settings.local.json`)
+### 3. Permissions (`.claude/settings.json`)
+
+Written by `arbor hook claude` alongside the hooks above — same file, so team
+members get both from one checked-in config.
 
 ```json
 {
   "permissions": {
-    "allow": ["Bash(arbor *)"]
+    "allow": ["Bash(arbor query *)", "Bash(arbor callers *)", "Bash(arbor map *)", "..."]
   }
 }
 ```
+
+Do **not** use a blanket `Bash(arbor *)`. That allow-lists `arbor scip --background`,
+which starts a multi-minute Gradle build, and `arbor index --force`, which
+replaces a compiler-resolved graph with guessed edges. The installed list is
+read-only commands plus `arbor scip --task-status`.
 
 ### 4. Agent instructions (`CLAUDE.md` at project root)
 

@@ -461,6 +461,23 @@ mod tests {
     }
 
     #[test]
+    fn permissions_are_read_only_commands_not_a_blanket_wildcard() {
+        // `Bash(arbor *)` would allow `arbor scip --background` (a multi-minute
+        // Gradle build) and `arbor index --force` (replaces compiler-resolved
+        // edges with guesses). Arbor's own docs recommended the wildcard until
+        // this was caught.
+        assert!(
+            !PERMISSIONS.contains(&"Bash(arbor *)"),
+            "a blanket allow-list would permit rebuilds and downgrades"
+        );
+        for p in PERMISSIONS {
+            assert!(
+                !p.contains("--force"),
+                "never allow-list the Tree-sitter downgrade: {p}"
+            );
+        }
+    }
+    #[test]
     fn permissions_are_all_well_formed_bash_patterns() {
         for p in PERMISSIONS {
             assert!(p.starts_with("Bash(arbor "), "malformed: {p}");
