@@ -5,7 +5,53 @@ All notable changes to Arbor will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] - 2.5.0
+## [Unreleased]
+
+### Added
+- **SCIP ingestion for JVM languages (`arbor-scip` crate):** consumes [SCIP](https://github.com/scip-code/scip) indexes from [`scip-java`](https://github.com/scip-code/scip-java) so Java/Kotlin/Scala graphs come from the compiler's own symbol resolution. Tree-sitter records `gateway.charge()` as the unresolvable reference `gateway.charge` and creates no edge; on a 406-document Spring service this recovered **418 methods** that previously reported zero callers, taking the graph from 11,300 to 45,543 edges. Driven by `arbor scip <index.scip>`.
+- **Virtual dispatch expansion:** SCIP `is_implementation` relationships are walked transitively (depth 4) so a call to an interface method also reaches its implementations, confidence-weighted `1/n` and dropped past 8 candidates. Without it, blast radius on interface-driven JVM code stops at the interface — `arbor refactor` reported a 248-caller method as an entry point with nothing calling it.
+- **`arbor scip --background`:** detached rebuild that invokes `scip-java`, re-ingests, and swaps the graph atomically only on success. Returns a task handle recorded in `.arbor/scip-task.json`; poll with `arbor scip --task-status` or via MCP `tasks/get`, which now falls back to the on-disk record.
+- **`PinnedEdge` / `ArborGraph::add_pinned_edges` / `GraphBuilder::add_pinned_edges`:** edges carrying node IDs rather than names, applied after name resolution so a compiler-resolved edge is never shadowed by a guessed one.
+- **`arbor index --force`:** the deliberate downgrade from a SCIP graph back to Tree-sitter.
+- **`ARBOR_NO_AUTO_REBUILD`:** opts out of the automatic rebuild. Set it in CI and in hooks.
+- **`scripts/scip-index.sh` and `scripts/arbor-scip-ingest.sh`:** generate an index (working around `scip-java`'s configuration-cache incompatibility) and ingest every module's index in one call.
+
+### Changed
+- **SCIP graphs are never silently replaced by Tree-sitter.** While `.arbor/scip.json` exists: reads serve the cache, `arbor index` and `index --changed-only` are refused without `--force`, `status`/`export` report the SCIP graph, `serve`/`bridge` serve the cache rather than a fresh Tree-sitter index, and `watch` watches without re-parsing. Previously a plain `arbor callers` whose cache failed to load would rebuild with Tree-sitter **and persist it**, destroying the graph as a side effect of a read.
+- **Reads auto-rebuild when sources are newer than `index.scip`** (blocking, since refreshing means running the compiler). Staleness is measured against the index rather than the graph cache, because re-ingesting refreshes the cache without regenerating the index. A rebuild that already failed for the same sources is not retried.
+- **`arbor viz` honours SCIP graphs.** Like the GUI, it called `index_directory` unconditionally and handed the visualizer a freshly-parsed Tree-sitter graph. Now uses `graph_for_serving`, and reports node/edge counts rather than files indexed.
+- **`arbor setup` is no longer a dead end on a SCIP project.** It called `index`, which correctly refuses, but `setup` exposes no `--force` — so the command failed with no way forward. It now reports the project as already set up and names the refresh command.
+- **`arbor bridge` announces what it is doing.** On a SCIP project it said "Starting initial index" while actually loading a cache, and reported "0 files".
+- **`arbor gui` honours SCIP graphs.** It previously called `index_directory` on every launch, so on a JVM project it displayed a freshly-parsed Tree-sitter graph — on a 406-document service, 11,300 edges instead of 45,543, with methods that have hundreds of callers shown as uncalled. Cache reading and provenance detection moved to `arbor-graph/src/cache.rs`, shared by both front ends.
+- **`arbor hook claude`** now allow-lists `arbor status` and `arbor scip --task-status`, and its injected `arbor map` PostToolUse hook runs with `ARBOR_NO_AUTO_REBUILD=1` — otherwise the agent's first tool call of the day could block on a full Gradle compile.
+
+### Fixed
+- **`docs/ARCHITECTURE.md`** claimed the WebSocket server listens on `ws://8080`; the default is `7432`.
+
+## [3.0.0] - 2026-08-10
+
+### Changed
+- **Symbols resolve by module, not by nearest directory.** Edges land on different nodes, so cached graphs, stored node IDs, and centrality baselines from 2.6.0 differ.
+- `Resolution` gains a `ViaImport` variant — an exhaustive match will not compile.
+
+### Known
+- Small targets now over-report blast radius; PageRank has no escape from a closed cycle; inheritance produces no edges; dynamic/reflective imports are unresolvable by construction. See the README for detail.
+
+## [2.6.0] - 2026-08-03 "Ground Truth"
+
+### Fixed
+- **Colliding symbols are kept** — `SymbolTable` used `HashMap::insert`, so a second `handler`/`new`/`process` replaced the first and was invisible to blast radius.
+- **Resolution is deterministic** — same-directory locality was decided by `HashMap` iteration order, so the same binary on the same input could build different edges between runs.
+- **Exported TS symbols indexed once** — `export_statement` recursion created two vertices sharing one node ID (133 phantom nodes on a 149-file app).
+- **Centrality is a percentile rank**, comparable across repositories, instead of being divided by the graph maximum.
+- **Resolution is O(1)**, not O(refs x nodes x files).
+
+### Added
+- **Edge confidence** in `[0,1]`, scored by how the reference resolved.
+- **Concept search** (`ArborGraph::search_ranked`) — identifier tokenization plus curated concept clusters, deterministic and offline.
+- **Hunk-level impact** (`changed_node_ids_for_ranges`).
+
+## [2.5.0] - 2026-07-15
 
 ### Added
 - **Parallel indexing:** `index_directory` fans the cache-check/parse phase out across all cores with rayon; results assemble in walk order so graph construction stays deterministic. Measured (median of 3, warm FS cache): Arbor itself 253ms → 95ms (2.7x, 123 files); tokio 2.7s → 1.6s (1.7x, 815 files / 178k LOC — serial graph assembly caps the gain, see `docs/BENCHMARKS.md`). Thread count is tunable via `RAYON_NUM_THREADS`.
@@ -214,7 +260,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [1.6.0] - 2026-03-16
 
-> See [Release Notes](docs/RELEASE_NOTES_v1.6.0.md) for full details.
+> Release notes for this version are no longer published.
 
 ## [1.5.0] - 2026-02-xx
 
@@ -222,7 +268,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [1.4.0] - 2026-02-xx "The Trust Update"
 
-> See [Release Notes](docs/RELEASE_NOTES_v1.4.0.md) for full details.
+> Release notes for this version are no longer published.
 
 ## [1.3.0] - 2026-01-xx
 

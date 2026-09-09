@@ -208,6 +208,23 @@ Examples:
 
 ## Available Tools
 
+Sixteen tools in three tiers. Tools added after v2.1.0 and not covered by the
+tables below:
+
+| Tool | Tier | Purpose |
+|------|------|---------|
+| `get_map` | Orientation | Ranked, token-budgeted skeleton of the codebase. **Recommended first call** — start here before any surgical query. |
+| `get_architecture_overview` | Orientation | Layer/module summary with entry points |
+| `explain_symbol` | Surgical | One symbol's role, centrality, and immediate neighbourhood |
+| `audit_security` | Broad | Call paths reaching a sensitive sink |
+| `batch_query` | Broad | Several graph queries in one round trip |
+
+On a JVM project whose graph came from a SCIP index (`arbor scip`), every tool
+above returns compiler-resolved edges — including `obj.method()` calls and
+interface implementations, which Tree-sitter cannot resolve. No separate tool is
+needed; ingestion is a CLI step. See [SCIP.md](SCIP.md).
+
+
 All tools return a standard envelope:
 ```json
 { "ok": true, "tool": "...", "arbor_version": "2.2.0", "data": {...}, "meta": { "node_count": N, "suggested_next_tool": "...", "suggested_next_args": {...} } }

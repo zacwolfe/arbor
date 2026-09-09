@@ -252,6 +252,7 @@ Every tool returns `{ ok, tool, data, meta: { suggested_next_tool, suggested_nex
 | `arbor agent review` | Autonomous PR architecture review |
 | `arbor agent onboard` | Codebase onboarding guide |
 | `arbor agent guard` | Real-time architectural safety gate |
+| `arbor scip <index.scip>` | Build the graph from a compiler-produced SCIP index (JVM) |
 | `arbor bridge` | MCP server (add `--http` for HTTP transport) |
 | `arbor watch` | Live re-index on file changes |
 | `arbor gui` | Native desktop UI |
@@ -305,6 +306,356 @@ Pinned installs: [docs/INSTALL.md](docs/INSTALL.md)
 **Fallback parsers:** Kotlin · Swift · Ruby · PHP · Shell
 
 [Adding languages →](docs/ADDING_LANGUAGES.md)
+
+JVM projects can go further than Tree-sitter allows — see below.
+
+---
+
+## JVM: compiler-accurate graphs via scip-java
+
+Tree-sitter reads source text. It cannot resolve this:
+
+```java
+public void pay() {
+    gateway.charge();   // which charge()? depends on the type of `gateway`
+}
+```
+
+Arbor records that call as the reference `gateway.charge`. No symbol has that
+name — `gateway` is a variable, not a type — so the reference does not resolve
+and **no edge is created**. Deliberate: inventing an edge to whichever
+`charge()` happened to match would be a false dependency. But on
+interface-driven JVM code, that is most of the call graph missing.
+
+Answering it needs type inference, which is a compiler's job. So instead of
+reimplementing javac, Arbor ingests [SCIP](https://github.com/scip-code/scip)
+indexes produced by [`scip-java`](https://github.com/scip-code/scip-java),
+which runs as a compiler plugin — its resolution *is* the compiler's.
+
+| | Tree-sitter | SCIP |
+|---|---|---|
+| `foo()` | resolved by name, confidence-weighted | exact |
+| `obj.method()` | **no edge** | exact |
+| Overloads | share one node | distinct nodes |
+| Interface → impl | not represented | `Implements` edges |
+| Virtual dispatch | not represented | synthesised call edges |
+| Needs a build | no | **yes** |
+
+Steps 2–4 below are automated by
+[`scripts/scip-index.sh`](scripts/scip-index.sh) — worth reading the steps once
+regardless, since the failure modes are easier to recognise than to debug.
+
+### 1. Install scip-java
+
+Requires **JDK 17+**. This is a one-time, per-machine step — do it *outside*
+your project. Any one of these:
+
+```bash
+# A. Docker — nothing installed locally. Run from the project root.
+docker run -v "$(pwd):/sources" --env JVM_VERSION=17 \
+  ghcr.io/scip-code/scip-java:latest scip-java index
+
+# B. Coursier, no install. Jars are cached after the first run.
+#    Run from the project root.
+coursier launch org.scip-code:scip-java:0.13.1 -- index
+
+# C. Coursier, standalone binary. Run this ONCE, in a directory on your PATH —
+#    `-o` writes the launcher to the current directory, so running it at your
+#    project root would leave a ~50MB binary in the repo.
+cd ~/.local/bin
+coursier bootstrap --standalone -o scip-java \
+  org.scip-code:scip-java:0.13.1 --main org.scip_code.scip_java.ScipJava
+scip-java --help
+```
+
+Option C is worth it if you will re-index regularly; A and B need no setup.
+Only `scip-java index` (step 2) runs at the project root.
+
+Use the **`scip-code/scip-java`** fork, not Sourcegraph's original. It emits
+*typed* occurrence ranges (SCIP 0.9, proto fields 8–11); Arbor reads the
+deprecated `repeated int32 range` too, but only the typed encoding is exercised
+against real indexes.
+
+### 2. Generate the index
+
+From the repository root, after a build that compiles cleanly:
+
+```bash
+scip-java index                    # auto-detects Gradle / Maven / sbt / Bazel
+```
+
+**Gradle with the configuration cache enabled** (`org.gradle.configuration-cache=true`
+in `gradle.properties`) fails with two errors — the real one being
+`invocation of 'Task.project' at execution time is unsupported` in
+`scipPrintDependencies`, and a misleading
+`Cannot get property 'dependenciesOut'` downstream of it. scip-java's plugin is
+not configuration-cache safe. Disable it for this invocation only:
+
+```bash
+scip-java index -- clean scipPrintDependencies scipCompileAll \
+  --no-configuration-cache
+```
+
+Args after `--` **replace** the build tool's task list rather than append to it,
+so every task must be named or nothing gets indexed.
+
+Where do those task names come from? scip-java prints the build command it runs,
+prefixed with `$`. The task list is the tail of that line:
+
+```
+$ ./gradlew --no-daemon --init-script /tmp/.../init-script.gradle \
+    -Dscip.targetroot=... clean scipPrintDependencies scipCompileAll
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+```
+
+`scipPrintDependencies` and `scipCompileAll` will not appear in `./gradlew tasks`
+— scip-java creates them at runtime via that injected init script. Run the bare
+command once, copy the tasks from its output, then re-run with your flag.
+
+Multi-module builds emit one `index.scip` per module.
+
+### 3. Ingest
+
+```bash
+arbor scip index.scip --root .
+```
+
+Pass **every** module's index in one call, or cross-module edges will not
+resolve — a symbol defined in module B is only linkable while B's definitions
+are in scope. [`scripts/arbor-scip-ingest.sh`](scripts/arbor-scip-ingest.sh)
+finds them all and makes that single call:
+
+```bash
+scripts/arbor-scip-ingest.sh                        # ingest whatever exists
+scripts/arbor-scip-ingest.sh --list                 # show what it would do
+scripts/arbor-scip-ingest.sh -- --merge             # pass flags to arbor scip
+```
+
+Use it rather than `arbor scip $(find . -name 'index.scip') --root .` — the
+naive form word-splits on paths containing spaces, silently indexes nothing
+when no index exists, and feeds arbor the zero-byte indexes a failed build
+leaves behind.
+
+| Flag | Effect |
+|------|--------|
+| `--root <path>` | Project root the index's relative paths hang off. SCIP paths are relative, Arbor stores absolute; joining here is what makes `arbor diff` and `arbor file-graph` work on the result. |
+| `--merge` | Also Tree-sitter-index the files SCIP does not cover, for polyglot repos. |
+| `--no-dispatch` | Skip virtual dispatch expansion — only what the compiler literally recorded. |
+| `--json` | Machine-readable stats. |
+
+### 4. Query as usual
+
+The graph is the same shape; the edges are just exact.
+
+```bash
+arbor callees "pay" .
+arbor callers "charge" .
+arbor map . --exclude-test
+arbor refactor "PaymentGateway.charge" .
+```
+
+Agents pick this up for free through the existing MCP tools — there is no
+separate SCIP tool, and none is needed. You run `arbor scip` once; `get_callers`,
+`analyze_impact`, and `get_map` then return compiler-resolved edges.
+
+### Steps 2–4 in one command
+
+```bash
+scripts/scip-index.sh              # from the project root
+```
+
+It runs `scip-java index`, and **only if that fails** reads the task list off
+the build command scip-java echoes, checks whether the failure was the Gradle
+configuration cache, and retries with `--no-configuration-cache`. On a project
+without the cache the first attempt succeeds and no second build is run.
+
+It then collects every `index.scip` produced — passing them all to `arbor scip`
+in one call, which is required for cross-module edges to resolve — and ingests.
+
+| Flag | Effect |
+|------|--------|
+| `--background` | Detach the run, log to `$TMPDIR`, return immediately. A scip-java run is a full compile. |
+| `--no-ingest` | Stop after producing the index; print the `arbor scip` command instead of running it. |
+| `--root <path>` | Project root to operate in (default: `.`). |
+| `--dry-run` | Print the commands without executing them. |
+| `-- <flags>` | Passed through to `arbor scip` (e.g. `-- --merge`). |
+
+Ingestion is delegated to `arbor-scip-ingest.sh`, so the collection rules live
+in one place. Use that script directly when the index already exists and you do
+not want to rebuild.
+
+It deliberately does **not** add `--no-configuration-cache` for failures that
+are not cache-related — a compile error stays a compile error rather than being
+masked as a scip problem, and the build output is surfaced as-is.
+
+### Virtual dispatch
+
+The part type resolution alone does not buy you. A call to
+`PaymentGateway.charge()` lands at runtime in `StripeGateway.charge()`. A graph
+that stops at the interface reports a blast radius of one for a change that
+reaches every implementation.
+
+SCIP records `is_implementation` relationships, so Arbor walks the override
+hierarchy and synthesises the missing call edges:
+
+- **Transitive to depth 4** — `interface → AbstractFoo → FooImpl` is three
+  levels and entirely ordinary in Spring code.
+- **Confidence `1/n`** for `n` candidates. One implementation is `1.0` — not a
+  guess, there is exactly one body it can reach.
+- **Dropped past 8 candidates.** A `Runnable` in a large codebase has hundreds;
+  "calls one of these" carries no information.
+- **The interface edge is kept.** Still true, and dropping it would lose the
+  fact that the code was written against the abstraction.
+
+`arbor callees` will therefore show both the interface method and its
+implementations. Filter on confidence if you want only the certainties.
+
+### Staleness is not silently repaired
+
+`arbor scip` writes `.arbor/scip.json`. While that marker exists, editing a
+source file does **not** trigger an automatic Tree-sitter re-index — the cached
+graph is served with a warning instead:
+
+```
+⚠ Sources changed since this graph was built from a SCIP index.
+  Re-run `arbor scip index.scip` to refresh it; serving the cached graph for now.
+```
+
+A silent rebuild would swap compiler-resolved edges for guessed ones, which is
+a downgrade nobody asked for. That applies to **every** operation that would
+rebuild the graph, not just the stale-cache read:
+
+| Command | On a SCIP project |
+|---------|-------------------|
+| `arbor callers` / `callees` / `map` / … | If Java sources are newer than `index.scip`, **rebuild synchronously** (runs the compiler), then answer. Otherwise serve the SCIP graph. If the cache cannot be read, refuse rather than fall back to Tree-sitter. |
+| `arbor index` | **Refused.** `arbor index --force` is the deliberate downgrade; it proceeds and clears the marker. |
+| `arbor index --changed-only` | **Refused.** The worst case, not the mildest: the two indexers build qualified names differently (`Svc.find` vs `com.pkg.Svc.find`), so a partial re-parse *duplicates* nodes rather than replacing them. |
+| `arbor status` / `export` | Report and emit the SCIP graph; `status` names its source. |
+| `arbor serve` / `bridge` | Serve the cached SCIP graph instead of a fresh Tree-sitter index — otherwise agents get guessed edges over MCP while the cache holds exact ones. |
+| `arbor watch` | Watches without re-parsing; warns once that the graph is stale and names the refresh command. |
+| `arbor gui` / `viz` | Load the cached SCIP graph instead of re-indexing with Tree-sitter. |
+| `arbor setup` | Reports the project as already set up rather than failing on the `index` guard. |
+
+Refreshing after a code change means re-running the compiler, which is a full
+build rather than a re-parse. Detach it and get your shell back:
+
+```bash
+arbor scip --background          # spawns scip-java + ingest, returns a handle
+arbor scip --task-status         # poll it
+arbor scip --task-status --json  # same, for agents
+```
+
+```
+✓ Rebuild started in the background
+  task: scip-1788912357
+  pid:  48927
+  log:  .arbor/scip-rebuild-1788912357.log
+```
+
+The current graph stays queryable for the whole build, and the swap is atomic —
+a failed build changes nothing at all, and the task records why:
+
+```
+scip-1788912357 ✗ failed  (70% — Rebuild failed; the existing graph was left untouched)
+error: scip-java failed; see the log.
+```
+
+Only one rebuild runs at a time: two concurrent `scip-java` invocations contend
+on the same Gradle project lock and would serialise anyway, at the cost of an
+unexplained stall.
+
+Agents poll the same handle through the MCP Tasks extension — `tasks/get` falls
+back to the on-disk record, since a detached rebuild lives in a different
+process from the bridge.
+
+`scripts/scip-index.sh --background` does the same thing without arbor, for
+users who would rather not have arbor spawn builds.
+
+### Dirtiness is detected, and acted on
+
+Staleness is measured against **`index.scip`**, not the graph cache — re-running
+`arbor scip <index>` rewrites the cache without regenerating the index, so a
+cache-based check would call a stale graph fresh.
+
+When any Java source is newer than the index, the next arbor command rebuilds
+before answering:
+
+```
+⏳ Java sources changed since index.scip was built — rebuilding now (this runs the compiler).
+  Prefer not to wait? Ctrl-C, then: arbor scip --background
+✓ Graph refreshed: 10596 nodes, 45543 edges
+```
+
+A stale answer to a question about code you just changed is worse than a slow
+one. Four guards keep that from becoming pathological:
+
+| Situation | Behaviour |
+|-----------|-----------|
+| Rebuild succeeds | Index is refreshed, so the next command does nothing |
+| Rebuild fails | Serves the previous graph and answers anyway; **does not retry** until sources change again, so a project that does not compile cannot start a build on every invocation |
+| A `--background` rebuild is already running | Waits for it rather than starting a second — concurrent Gradle runs contend on the same project lock |
+| `scip-java` not on PATH | Serves the cache and says how to fix the setup |
+
+Opt out entirely with `ARBOR_NO_AUTO_REBUILD=1` — worth setting in CI and in
+scripts, where a read command turning into a multi-minute build is not
+acceptable:
+
+```
+⚠ Java sources are newer than the SCIP index, but auto-rebuild is disabled
+  (ARBOR_NO_AUTO_REBUILD) — serving the cached graph.
+```
+
+### `arbor watch` on a SCIP project
+
+Watches, but never re-parses. On the first source change it says so once and
+names the fix:
+
+```
+⚠ Sources changed — the graph is now stale.
+  Refresh in the background: arbor scip --background
+  Poll a background run:     arbor scip --task-status
+```
+
+It clears the warning when a background rebuild completes, so the next edit
+warns again. No surprise builds, and no Tree-sitter data presented as the graph.
+
+### Measured
+
+A 406-document Spring service, 31 MB index:
+
+```
+✓ Ingested 406 documents from scip-java (java)
+  10576 definitions across 402 files
+  41526 references resolved, 170148 external (JDK, jars, packages), 2055 unattributed
+  26767 references ignored (locals, params, type params), 594 self/recursive, 0 unreadable
+  837 implements/override edges, 3091 added by dispatch expansion
+✓ Graph: 10576 nodes, 45420 edges (43397 confident)
+```
+
+Reference counters are exhaustive by construction —
+`resolved + external + ignored + unattributed + self + unreadable` equals every
+non-definition occurrence in the index (241,090 above, residual zero). Asserted
+in tests, because an unaccounted remainder is indistinguishable from a decoding
+bug.
+
+`10576` is lower than the index's raw 28,320 definitions, and that is correct:
+17,617 are locals and 124 are type parameters, neither of which belongs in a
+call graph.
+
+### Limits, written down
+
+- **Needs a successful build.** No compile, no index. An empty index is
+  rejected rather than silently accepted as an empty graph.
+- **No incremental refresh.** Re-run the indexer and `arbor scip`. `arbor watch`
+  does not update a SCIP graph.
+- **Reflection and DI wiring are invisible.** Spring `@Autowired` and anything
+  reflective are not calls in the index. Dispatch expansion covers the common
+  interface-injection case indirectly; a bean resolved purely by name is not
+  represented.
+- **Visibility is unknown.** SCIP carries no portable access modifiers, so SCIP
+  nodes keep the default rather than a guess.
+
+Full reference: [docs/SCIP.md](docs/SCIP.md)
 
 ---
 
@@ -363,7 +714,7 @@ arbor-core (Tree-sitter parsing)
 2. **Accessibility second** — works across ecosystems, runs anywhere
 3. **Affordability next** — minimal overhead, from laptops to monoliths
 
-Arbor is **local-first**: no mandatory data exfiltration, offline-capable, open source. [Security policy →](SECURITY.md)
+Arbor is **local-first**: no mandatory data exfiltration, offline-capable, open source. [Security policy →](.github/SECURITY.md)
 
 ---
 
@@ -375,7 +726,7 @@ cargo test --workspace
 cargo clippy --workspace --all-targets --all-features
 ```
 
-[CONTRIBUTING.md](CONTRIBUTING.md) · [Good first issues](docs/GOOD_FIRST_ISSUES.md) · [Code of conduct](CODE_OF_CONDUCT.md)
+[CONTRIBUTING.md](.github/CONTRIBUTING.md) · [Good first issues](docs/GOOD_FIRST_ISSUES.md) · [Code of conduct](.github/CODE_OF_CONDUCT.md)
 
 ---
 

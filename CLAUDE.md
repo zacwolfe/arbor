@@ -45,12 +45,14 @@ Arbor is a **semantic code graph engine** — it parses codebases into a depende
 
 ```
 arbor-core  →  arbor-graph  →  arbor-watcher
-                     │                │
-                     └───── arbor-server ─────┐
-                                              │
-                     arbor-mcp ───────────────┤
-                     arbor-cli ───────────────┘
-                     arbor-gui ──────────────────→ arbor-{core,graph,watcher}
+                     │               │
+                     ├──→ arbor-scip │
+                     │               │
+                     └──→ arbor-server ──────┐
+                                             │
+                     arbor-mcp ──────────────┤
+                     arbor-cli ──────────────┘  (also → arbor-scip)
+                     arbor-gui ─────────────────→ arbor-{core,graph,watcher}
 ```
 
 ### Crate Roles
@@ -66,6 +68,14 @@ arbor-core  →  arbor-graph  →  arbor-watcher
 - `symbol_table.rs` — cross-file FQN resolution
 - `confidence.rs` — edge confidence scoring
 - `store.rs` — sled-backed persistence
+
+**`arbor-scip`** — SCIP index ingestion, for compiler-accurate JVM graphs. Tree-sitter cannot resolve `obj.method()` without type inference, so those calls are dropped; a [SCIP](https://github.com/scip-code/scip) index from [`scip-java`](https://github.com/scip-code/scip-java) (Java/Kotlin/Scala compiler plugins) carries the compiler's own resolution instead. Modules:
+- `ingest.rs` — two-pass conversion: `Definition` occurrences → `CodeNode`, other occurrences → edges typed by the target's kind
+- `symbols.rs` — SCIP symbol strings (`semanticdb maven . . com/example/Svc#find().`) → qualified name + `NodeKind`; overloads keep their disambiguator so they stay distinct nodes
+- `dispatch.rs` — virtual dispatch expansion from `is_implementation` relationships, confidence-weighted `1/n` by fan-out
+- `ranges.rs` — SCIP range decoding and enclosing-definition attribution
+
+Feeds the graph through `GraphBuilder::add_pinned_edges` / `ArborGraph::add_pinned_edges`, which bypass name resolution entirely — running compiler-resolved edges through it would discard their precision. Driven by `arbor scip`.
 
 **`arbor-watcher`** — `notify`-based file watcher. Debounces at 100ms, respects `.gitignore`, triggers incremental re-parse of changed files only. Two-tier cache: file-level AST + node-level byte ranges.
 
@@ -92,8 +102,9 @@ Key features:
 - `audit "sink"`: traces call paths to sensitive sinks (e.g. `db_query`, `exec`).
 - `explain "question"`: graph-backed context slicing for a question (`--tokens`, `--why`).
 - `hook claude [--global]`: installs Arbor directives + hooks into Claude Code settings.
+- `scip <index.scip>...`: builds the graph from compiler-produced SCIP indexes (`--root`, `--merge`, `--no-dispatch`, `--json`).
 
-**`arbor-gui`** — egui immediate-mode desktop UI. Standalone binary.
+**`arbor-gui`** — egui immediate-mode desktop UI. Standalone binary. Uses `arbor_graph::cache` to load a SCIP-provenanced graph rather than re-indexing (it previously always re-parsed with Tree-sitter, so on a JVM project it showed a different graph from the CLI).
 
 ### Data Flow
 
@@ -114,11 +125,14 @@ Key features:
 - **Centrality persistence**: `arbor map` computes PageRank on first call and saves it to the binary cache. Subsequent calls skip recomputation (~0.5s vs ~1.5s).
 - **Atomic cache writes**: `save_graph_binary`/`save_graph_snapshot` write to `.tmp` then atomically rename, preventing concurrent processes from reading half-written caches.
 - **Sled lock avoidance**: CLI commands skip the sled store path if `cache/db` exists (implies a bridge may hold the exclusive lock). Falls back to re-indexing from source.
+- **SCIP edges bypass name resolution**: `PinnedEdge` endpoints are node IDs, applied after `resolve_edges()`. A compiler-resolved edge routed through name matching would lose the only thing that makes it better than a guess.
+- **Virtual dispatch expansion**: a call to an interface method also gets edges to its implementations (transitive, depth 4), confidence `1/n` and dropped past 8 candidates. Without it, blast radius on interface-driven JVM code stops at the interface and understates the real reach.
+- **SCIP provenance guard**: `arbor scip` writes `.arbor/scip.json`. While it exists, *no* operation lets Tree-sitter replace the graph: reads serve the cache and `load_or_index_graph` refuses its rebuild-and-persist fallthrough (which previously destroyed the graph from a plain read), `index`/`index --changed-only` refuse without `--force`, `status`/`export` report the SCIP graph, and `serve`/`bridge` serve the cache rather than a fresh Tree-sitter index. reads auto-rebuild when Java sources are newer than `index.scip` (blocking; measured against the index rather than the graph cache, since re-ingesting refreshes the cache without regenerating the index) and never retry a rebuild that already failed for the same sources — `ARBOR_NO_AUTO_REBUILD=1` opts out; `watch` watches without re-parsing and warns once. `gui`/`viz` load the cached graph rather than re-indexing, and `setup` reports an already-SCIP project instead of hitting the `index` guard with no `--force` available. Cache reading and provenance detection live in `arbor-graph/src/cache.rs` so the CLI and GUI share one implementation. Enforced by `refuse_if_scip_provenanced()`. Refreshing needs a full compile: `arbor scip --background` spawns a detached worker (`arbor-cli/src/scip_pipeline.rs` invokes scip-java with the config-cache retry), records a file-backed handle in `.arbor/scip-task.json` (`arbor-graph/src/scip_task.rs`) that both `arbor scip --task-status` and MCP `tasks/get` can poll, and swaps the graph only on success.
 - **Whitespace-only diff filtering**: `git_changed_files()` cross-references `--name-status` against `--numstat` to exclude files with only whitespace changes.
 
 ### `.arbor/` Directory
 
-Local cache created by `arbor init`/`arbor setup`. Contains `config.json` with default settings, `graph.bin` (bincode-serialized graph with centrality scores), and `graph.json` (JSON snapshot). Treated as workspace root marker alongside `.git`, `Cargo.toml`, `package.json`, `go.mod`, `pyproject.toml`.
+Local cache created by `arbor init`/`arbor setup`. Contains `config.json` with default settings, `graph.bin` (bincode-serialized graph with centrality scores), `graph.json` (JSON snapshot), and — when the graph was built by `arbor scip` — `scip.json` recording which indexes it came from. Treated as workspace root marker alongside `.git`, `Cargo.toml`, `package.json`, `go.mod`, `pyproject.toml`.
 
 ## CLI Command Reference
 
@@ -127,6 +141,7 @@ Local cache created by `arbor init`/`arbor setup`. Contains `config.json` with d
 | `setup .` | One-shot init + index |
 | `init .` | Initialize `.arbor/` config |
 | `index .` | Parse and build graph |
+| `scip index.scip` | Build graph from a SCIP index (JVM, compiler-accurate) |
 | `map . --exclude-test` | Ranked project skeleton (token-budgeted) |
 | `query "name" .` | Fuzzy symbol search (supports `\|` for OR) |
 | `callers "sym" .` | Who calls this? |
@@ -209,7 +224,9 @@ To integrate arbor into a target project for AI agent use:
 **What these do:**
 - **PreToolUse #1**: Auto-initializes `.arbor/` if an arbor command is called but the project isn't set up yet.
 - **PreToolUse #2**: Blocks recursive grep/ripgrep and tells the agent to use arbor instead.
-- **PostToolUse**: Injects `arbor map` output (project skeleton) on the first Bash call each day. Flag file is per-project (`.arbor/.map-injected-<date>`), so each project triggers independently.
+- **PostToolUse**: Injects `arbor map` output (project skeleton) on the first Bash call each day. Flag file is per-project (`.arbor/.map-injected-<date>`), so each project triggers independently. Runs with `ARBOR_NO_AUTO_REBUILD=1` — on a SCIP project a stale index would otherwise make this hook block on a full compile, with `2>/dev/null` hiding why.
+
+`arbor hook claude` also allow-lists `arbor scip --task-status` (read-only) but deliberately **not** `arbor scip *`, since that would let an agent start a multi-minute Gradle build unprompted, and its injected guidance tells the agent never to run `arbor index` on a SCIP project.
 
 ### 3. Permissions (`.claude/settings.local.json`)
 

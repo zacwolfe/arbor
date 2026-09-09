@@ -53,6 +53,22 @@ arbor bridge --viz
 | `arbor init` | Creates `.arbor/` config directory |
 | `arbor index` | Full index of the codebase |
 | `arbor index --changed-only` | Incremental index of git-modified files |
+| `arbor index --force` | Re-index with Tree-sitter even on a SCIP project (downgrades the graph) |
+| `arbor scip <index.scip>` | Build the graph from a compiler-produced SCIP index (JVM) |
+| `arbor scip --background` | Regenerate the index and re-ingest in a detached process |
+| `arbor scip --task-status` | Poll a detached rebuild |
+| `arbor map` | Ranked, token-budgeted project skeleton |
+| `arbor callers <symbol>` | Who calls this? (one hop upstream) |
+| `arbor callees <symbol>` | What does this call? (one hop downstream) |
+| `arbor entry-points` | HTTP handlers, main functions, webhooks, jobs |
+| `arbor file-graph <path>` | Symbols + internal edges within one file |
+| `arbor inspect <symbol>` | Full detail on one symbol |
+| `arbor path <a> <b>` | Shortest call-graph path between two symbols |
+| `arbor summary` | Auto-generate a pull request description |
+| `arbor agent review` | Autonomous PR architecture review |
+| `arbor agent onboard` | Generate a contributor onboarding guide |
+| `arbor agent guard` | Architecture violation check |
+| `arbor hook claude` | Install Arbor directives + hooks into Claude Code |
 | `arbor query <q>` | Search the graph |
 | `arbor diff` | Preview blast radius for current git changes |
 | `arbor check` | CI safety gate for risky change sets |
@@ -88,8 +104,8 @@ arbor check --json --max-blast-radius 30
 - [Quickstart](../../docs/QUICKSTART.md)
 - [Installation](../../docs/INSTALL.md)
 - [MCP Integration](../../docs/MCP_INTEGRATION.md)
-- [v1.6 Release Notes](../../docs/RELEASE_NOTES_v1.6.0.md)
-- [v1.6.2 Release Notes](../../docs/RELEASE_NOTES_v1.6.2.md)
+- [Changelog](../../CHANGELOG.md) — full release history
+- [SCIP ingestion](../../docs/SCIP.md) — compiler-accurate graphs for JVM projects
 
 ## Supported Languages
 
@@ -100,3 +116,20 @@ Rust, TypeScript, JavaScript, Python, Go, Java, C, C++, C#, Dart, Kotlin, Swift,
 - **Main Repository**: [github.com/Anandb71/arbor](https://github.com/Anandb71/arbor)
 - **Documentation**: [docs/](https://github.com/Anandb71/arbor/tree/main/docs)
 - **Glama MCP Directory**: [glama.ai/mcp/servers/@Anandb71/arbor](https://glama.ai/mcp/servers/@Anandb71/arbor)
+
+## Environment variables
+
+| Variable | Effect |
+|----------|--------|
+| `ARBOR_AUTO_INDEX=1` | Allow indexing a project that has no `.arbor/` yet |
+| `ARBOR_NO_AUTO_REBUILD=1` | On a SCIP project, never rebuild automatically when sources are newer than the index. Set this in CI and in hooks — otherwise a read command can block on a full compile. |
+| `ARBOR_DIFF_BASE` / `ARBOR_DIFF_HEAD` | Override the git range used by `diff`/`check` |
+| `ARBOR_EDITOR` | Editor used by `arbor open` |
+
+## SCIP projects (JVM)
+
+When a graph was built by `arbor scip`, `.arbor/scip.json` records it and Arbor
+refuses to let Tree-sitter replace that graph: `arbor index` errors without
+`--force`, reads serve the cache, and `serve`/`bridge` serve the cache rather
+than a fresh Tree-sitter index. See
+[docs/SCIP.md](https://github.com/Anandb71/arbor/blob/main/docs/SCIP.md).

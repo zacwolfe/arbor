@@ -27,7 +27,7 @@ Arbor is a "Unified Nervous System" that connects your codebase, AI agents, and 
                                      ┌────────┴────────┐
                                      │   SyncServer    │
                                      │  (WebSocket)    │
-                                     │  ws://8080      │
+                                     │  ws://7432      │
                                      └────────┬────────┘
                                               │
                     ┌─────────────────────────┼─────────────────────────┐
@@ -40,9 +40,9 @@ Arbor is a "Unified Nervous System" that connects your codebase, AI agents, and 
                                               │
                                               ▼
                                      ┌─────────────────┐
-                                     │   arbor-core    │
-                                     │  (Tree-sitter)  │
-                                     │   144ms parse   │
+                                     │   arbor-core    │◀── arbor-scip
+                                     │  (Tree-sitter)  │    (SCIP index,
+                                     │   144ms parse   │     JVM only)
                                      └────────┬────────┘
                                               │
                                               ▼
@@ -55,6 +55,7 @@ Arbor is a "Unified Nervous System" that connects your codebase, AI agents, and 
 ### The Flow
 
 1. **Parsing**: `arbor-core` parses your codebase with Tree-sitter (~144ms for 10k lines)
+   — or, for JVM projects, `arbor-scip` ingests a compiler-produced SCIP index instead
 2. **Graphing**: `arbor-graph` builds a dependency graph with petgraph
 3. **Watching**: `arbor-watcher` detects file changes and triggers re-indexing
 4. **Serving**: `arbor-server` exposes the graph via JSON-RPC over WebSocket
@@ -108,6 +109,26 @@ pub struct ArborGraph {
     pub fn compute_centrality(&mut self);
 }
 ```
+
+### arbor-scip
+
+Ingests [SCIP](https://github.com/scip-code/scip) indexes produced by
+[`scip-java`](https://github.com/scip-code/scip-java), giving Java, Kotlin, and
+Scala projects a graph built from the compiler's own symbol resolution rather
+than from Tree-sitter's pattern matching.
+
+- **Why**: Tree-sitter records `gateway.charge()` as the reference
+  `gateway.charge`, which matches no symbol, so no edge is created. Resolving it
+  needs the type of `gateway` — a compiler's job.
+- **Two-pass ingest**: `Definition` occurrences become nodes; every other
+  occurrence becomes an edge typed by its target's kind.
+- **Virtual dispatch**: SCIP's `is_implementation` relationships are walked so a
+  call to an interface method also reaches its implementations, confidence
+  weighted `1/n` and capped at 8 candidates.
+- **Exact edges**: emitted as `arbor_graph::PinnedEdge` (node IDs, not names) so
+  they bypass name resolution entirely.
+
+Driven by `arbor scip`. See [SCIP.md](SCIP.md).
 
 ### arbor-watcher
 

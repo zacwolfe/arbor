@@ -89,6 +89,61 @@ arbor check --json --max-blast-radius 30
 arbor open parse_file
 ```
 
+## Navigate the graph
+
+```bash
+arbor map . --exclude-test          # ranked project skeleton — start here
+arbor callers "symbol" .            # who calls this?
+arbor callees "symbol" .            # what does this call?
+arbor entry-points .                # HTTP handlers, main, jobs, webhooks
+arbor file-graph "src/Foo.java" .   # symbols + edges in one file
+arbor inspect "symbol" .            # full detail on one symbol
+arbor path "start" "end" .          # shortest call-graph path
+```
+
+All of these accept `--json`.
+
+## Wire up an AI agent
+
+```bash
+arbor hook claude          # installs directives + hooks into .claude/
+arbor hook claude --global # or into your user config
+```
+
+This writes an Arbor block into `CLAUDE.md`, registers PreToolUse/PostToolUse
+hooks (auto-init, grep blocking, daily project-skeleton injection), and
+allow-lists the read-only arbor commands so the agent runs them without a
+prompt. Re-running updates the block in place.
+
+## JVM projects: compiler-accurate graphs
+
+Tree-sitter cannot resolve `obj.method()` — that needs the type of `obj`. For
+Java, Kotlin, and Scala, ingest a
+[SCIP](https://github.com/scip-code/scip) index instead:
+
+```bash
+scip-java index                     # requires JDK 17+; a full compile
+arbor scip index.scip --root .
+```
+
+Then query exactly as above — same commands, exact edges. Refresh after code
+changes with `arbor scip --background` (detached) and poll it with
+`arbor scip --task-status`.
+
+Once a project has a SCIP graph, `arbor index` is refused so Tree-sitter cannot
+silently downgrade it; `arbor index --force` is the deliberate override. Set
+`ARBOR_NO_AUTO_REBUILD=1` in CI, where a read command turning into a
+multi-minute build is not acceptable. Full detail: [SCIP.md](SCIP.md).
+
+## Agent workflows
+
+```bash
+arbor agent review .    # autonomous PR architecture review
+arbor agent onboard .   # contributor onboarding guide
+arbor agent guard .     # architecture violation check
+arbor summary .         # auto-generate a PR description
+```
+
 ## Use the GUI
 
 ```bash
@@ -181,6 +236,6 @@ If `arbor check` fails, run focused tests before merge and include blast-radius 
 - [Supported Languages](./ADDING_LANGUAGES.md)
 - [MCP Protocol](./PROTOCOL.md)
 - [MCP Integration](./MCP_INTEGRATION.md)
-- [Release Notes (v1.6)](./RELEASE_NOTES_v1.6.0.md)
-- [Release Notes (v1.6.2)](./RELEASE_NOTES_v1.6.2.md)
+- [Changelog](../CHANGELOG.md) — full release history
+- [SCIP ingestion](SCIP.md) — compiler-accurate graphs for JVM projects
 - [Glama MCP Directory Listing](https://glama.ai/mcp/servers/@Anandb71/arbor)
