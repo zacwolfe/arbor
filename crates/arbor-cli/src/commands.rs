@@ -404,6 +404,43 @@ fn auto_rebuild_scip(project_root: &Path, indexes: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// The indexers this project needs *and* has installed, or an explanation.
+///
+/// Shared by the `--background` launcher and the worker so a rebuild cannot be
+/// started that the worker will immediately abandon.
+fn runnable_indexers(project_root: &Path) -> Result<Vec<&'static crate::indexers::Indexer>> {
+    let detected = crate::indexers::detect(project_root);
+    let runnable: Vec<_> = detected
+        .iter()
+        .copied()
+        .filter(|i| crate::indexers::on_path(i.binary))
+        .collect();
+
+    if !runnable.is_empty() {
+        return Ok(runnable);
+    }
+
+    if detected.is_empty() {
+        return Err(format!(
+            "No SCIP indexer matches {}.\n  \
+Detection looks for a build file at the project root — Cargo.toml, \
+tsconfig.json, pyproject.toml, go.mod, build.gradle, pom.xml, and so on.\n  \
+Already have an index? Ingest it directly: arbor scip <index.scip>",
+            project_root.display()
+        )
+        .into());
+    }
+
+    let mut message = String::from("No matching SCIP indexer is installed. This project needs:\n");
+    for indexer in &detected {
+        message.push_str(&format!(
+            "  {} for {}\n    {}\n",
+            indexer.binary, indexer.language, indexer.install
+        ));
+    }
+    Err(message.into())
+}
+
 /// Explains why no rebuild happened, naming the exact install command.
 ///
 /// Two distinct situations, and conflating them wastes the user's time: nothing
@@ -1231,36 +1268,6 @@ fn resolve_node_or_file_target(
         .map(|node| (node.file.clone(), node.line_start))
 }
 
-/// Whether an executable of this name is resolvable on `PATH`.
-///
-/// Deliberately not [`command_exists`], which probes with `--version` and
-/// requires exit 0. `scip-java` is a JVM launcher: that probe would spawn a
-/// whole JVM to answer "does this exist", and a coursier-bootstrapped launcher
-/// need not support the flag at all.
-fn binary_on_path(name: &str) -> bool {
-    let Some(path) = std::env::var_os("PATH") else {
-        return false;
-    };
-
-    std::env::split_paths(&path).any(|dir| {
-        let candidate = dir.join(name);
-        match candidate.metadata() {
-            Ok(meta) => {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    meta.is_file() && meta.permissions().mode() & 0o111 != 0
-                }
-                #[cfg(not(unix))]
-                {
-                    meta.is_file()
-                }
-            }
-            Err(_) => false,
-        }
-    })
-}
-
 fn command_exists(cmd: &str) -> bool {
     // Input validation to prevent command injection (CWE-78)
     if cmd.is_empty() || cmd.len() > 255 {
@@ -1560,11 +1567,10 @@ pub fn scip_background(root: &Path, merge: bool, no_dispatch: bool) -> Result<()
     let resolved_path = resolve_project_path(root)?;
     init_arbor_dir(&resolved_path)?;
 
-    if !binary_on_path("scip-java") {
-        return Err("scip-java not on PATH. --background invokes it directly; \
-see the JVM section of Arbor's README."
-            .into());
-    }
+    // Checked here as well as in the worker: refusing before detaching means the
+    // user reads the reason immediately, rather than having to go and find a log
+    // to discover that nothing could have run.
+    runnable_indexers(&resolved_path)?;
 
     // Refuse to stack rebuilds: two concurrent scip-java runs contend on the
     // same Gradle project lock and would serialise anyway, at the cost of an

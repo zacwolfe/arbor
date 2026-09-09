@@ -707,6 +707,62 @@ fn a_dirty_index_without_scip_java_serves_the_cache_and_explains() {
     assert!(output.status.success(), "must still answer from the cache");
 }
 
+/// `--background` must refuse before detaching. Launching a worker that cannot
+/// possibly run anything sends the user to a log to find out nothing happened.
+#[test]
+fn background_refuses_up_front_when_no_indexer_is_installed() {
+    let temp = setup_java_project();
+    let dir = temp.path();
+
+    let output = run_arbor_without_scip_java(dir, &["scip", "--background", "."]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "must not detach a worker that cannot run: {stderr}"
+    );
+    assert!(
+        stderr.contains("No matching SCIP indexer is installed"),
+        "should say what is missing, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("scip-java"),
+        "should name the indexer this project needs, got: {stderr}"
+    );
+    assert!(
+        !dir.join(".arbor/scip-task.json").exists(),
+        "no task record should be written for a rebuild that never started"
+    );
+}
+
+/// The Python case that exposed this: a project whose indexer is installed must
+/// not be blocked by `scip-java` being absent.
+#[test]
+fn background_does_not_require_scip_java_for_a_non_jvm_project() {
+    let temp = TempDir::new().expect("create temp dir");
+    let dir = temp.path();
+    fs::write(
+        dir.join("pyproject.toml"),
+        "[project]\nname = \"scratch\"\n",
+    )
+    .unwrap();
+    fs::create_dir_all(dir.join(".git")).unwrap();
+
+    let output = run_arbor_without_scip_java(dir, &["scip", "--background", "."]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // scip-python is not installed in the test environment either, so this must
+    // fail — but naming scip-python, not scip-java.
+    assert!(
+        stderr.contains("scip-python"),
+        "a Python project's missing indexer is scip-python, got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("scip-java"),
+        "must not mention the JVM indexer on a Python project, got: {stderr}"
+    );
+}
+
 /// A project no indexer recognises is a different problem from a missing
 /// indexer, and saying "install scip-java" there would send the user nowhere.
 #[test]

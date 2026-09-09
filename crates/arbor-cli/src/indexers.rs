@@ -218,6 +218,10 @@ pub fn by_binary(binary: &str) -> Option<&'static Indexer> {
 }
 
 /// Whether an executable of this name is on `PATH`.
+///
+/// Deliberately a `PATH` walk rather than probing with `--version`: `scip-java`
+/// is a JVM launcher, so that probe would start a whole JVM just to answer "does
+/// this exist", and some launchers exit non-zero on an unrecognised flag anyway.
 pub fn on_path(binary: &str) -> bool {
     let Some(path) = std::env::var_os("PATH") else {
         return false;
