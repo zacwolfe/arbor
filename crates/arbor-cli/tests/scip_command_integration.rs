@@ -707,6 +707,106 @@ fn a_dirty_index_without_scip_java_serves_the_cache_and_explains() {
     assert!(output.status.success(), "must still answer from the cache");
 }
 
+/// The question that motivated the command: which classes implement this
+/// interface. Only a compiler index can answer it.
+#[test]
+fn implementors_finds_the_implementation() {
+    let temp = setup_java_project();
+    let dir = temp.path();
+
+    run_arbor_stdout(dir, &["scip", "index.scip", "--root", "."]);
+
+    let stdout = run_arbor_stdout(dir, &["implementors", "Gateway.charge", "."]);
+    assert!(
+        stdout.contains("StripeGateway"),
+        "the implementing method must be listed: {stdout}"
+    );
+}
+
+/// `subclasses` is the word half of users reach for.
+#[test]
+fn subclasses_is_an_alias() {
+    let temp = setup_java_project();
+    let dir = temp.path();
+
+    run_arbor_stdout(dir, &["scip", "index.scip", "--root", "."]);
+    let stdout = run_arbor_stdout(dir, &["subclasses", "Gateway.charge", "."]);
+    assert!(stdout.contains("StripeGateway"), "got: {stdout}");
+}
+
+/// Graceful degradation, the hard requirement: a Tree-sitter graph must say it
+/// cannot answer, not that there is nothing to find. Reporting "none" here is
+/// how someone deletes an interface four classes implement.
+#[test]
+fn implementors_on_a_tree_sitter_graph_says_it_cannot_answer() {
+    let temp = setup_java_project();
+    let dir = temp.path();
+
+    // A plain Tree-sitter index — no SCIP anywhere.
+    run_arbor_stdout(dir, &["index", "."]);
+
+    let output = run_arbor(dir, &["implementors", "Gateway", "."]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        output.status.success(),
+        "a missing capability is not a user error: {stdout}"
+    );
+    assert!(
+        stdout.contains("no type hierarchy"),
+        "must say the graph cannot answer: {stdout}"
+    );
+    assert!(
+        stdout.contains("Tree-sitter"),
+        "must name the producer it is talking about: {stdout}"
+    );
+    assert!(
+        stdout.contains("arbor scip"),
+        "must name the way to get an answer: {stdout}"
+    );
+    assert!(
+        !stdout.contains("Nothing implements"),
+        "must not report absence as fact: {stdout}"
+    );
+}
+
+/// A SCIP graph whose indexer *does* carry a hierarchy, where this symbol simply
+/// has no implementors, is a different message — and this one may state it.
+#[test]
+fn implementors_on_a_scip_graph_may_report_a_genuine_absence() {
+    let temp = setup_java_project();
+    let dir = temp.path();
+
+    run_arbor_stdout(dir, &["scip", "index.scip", "--root", "."]);
+
+    // Checkout.pay implements nothing, on a graph that does carry Implements edges.
+    let stdout = run_arbor_stdout(dir, &["implementors", "Checkout.pay", "."]);
+    assert!(
+        stdout.contains("Nothing implements or extends"),
+        "a hierarchy-carrying graph may state the absence: {stdout}"
+    );
+    assert!(
+        stdout.contains("accounted for"),
+        "and must say how much that is worth: {stdout}"
+    );
+}
+
+/// The JSON form has to carry the same distinction, or a tool consuming it
+/// re-invents the mistake the human output avoids.
+#[test]
+fn implementors_json_reports_whether_the_answer_is_knowable() {
+    let temp = setup_java_project();
+    let dir = temp.path();
+
+    run_arbor_stdout(dir, &["index", "."]);
+    let stdout = run_arbor_stdout(dir, &["implementors", "Gateway", ".", "--json"]);
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+
+    assert_eq!(value["hierarchyAvailable"], false);
+    assert_eq!(value["provenance"], "tree-sitter");
+    assert_eq!(value["implementors"].as_array().unwrap().len(), 0);
+}
+
 /// "No callers" must never be reported as safety. It used to read "Safe to
 /// change, but verify external usage", which is a safety claim derived from
 /// absence of evidence.

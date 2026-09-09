@@ -81,9 +81,9 @@ Feeds the graph through `GraphBuilder::add_pinned_edges` / `ArborGraph::add_pinn
 
 **`arbor-server`** — Tokio WebSocket server on `ws://localhost:7432`. JSON-RPC methods: `discover`, `impact`, `context`, `graph.subscribe`, `spotlight`. RwLock-protected shared graph state.
 
-**`arbor-mcp`** — MCP bridge for AI agents (stdio by default, stateless HTTP via `arbor bridge --http --port 3333`). Speaks MCP `2026-07-28` with fallback for `2025-03-26` clients. Sixteen tools:
+**`arbor-mcp`** — MCP bridge for AI agents (stdio by default, stateless HTTP via `arbor bridge --http --port 3333`). Speaks MCP `2026-07-28` with fallback for `2025-03-26` clients. Seventeen tools:
 - **Orientation**: `get_map` — ranked, token-budgeted skeleton of the codebase (recommended first call), `get_architecture_overview`
-- **Surgical**: `list_entry_points`, `get_callers`, `get_callees`, `search_symbols`, `get_file_graph`, `get_node_detail`, `explain_symbol`
+- **Surgical**: `list_entry_points`, `get_callers`, `get_callees`, `get_implementors`, `search_symbols`, `get_file_graph`, `get_node_detail`, `explain_symbol`
 - **Broad**: `get_logic_path`, `get_knowledge_path`, `find_path`, `analyze_impact`, `get_blast_radius` (git-diff based), `audit_security`, `batch_query`
 
 Module layout: `lib.rs` (tool dispatch + `tools/list`), `protocol.rs` (version negotiation, caching metadata), `tasks.rs` (Tasks extension — background indexing returns task handles agents can poll during cold start), `apps.rs` (MCP Apps — interactive blast-radius and architecture-map UIs via `ui://arbor/*` resources), `http.rs` (HTTP transport with `Mcp-Method`/`Mcp-Name` header routing), `git.rs`.
@@ -125,6 +125,7 @@ Key features:
 - **Centrality persistence**: `arbor map` computes PageRank on first call and saves it to the binary cache. Subsequent calls skip recomputation (~0.5s vs ~1.5s).
 - **Atomic cache writes**: `save_graph_binary`/`save_graph_snapshot` write to `.tmp` then atomically rename, preventing concurrent processes from reading half-written caches.
 - **Sled lock avoidance**: CLI commands skip the sled store path if `cache/db` exists (implies a bridge may hold the exclusive lock). Falls back to re-indexing from source.
+- **Inheritance queries degrade loudly, never silently**: `arbor implementors` and MCP `get_implementors` distinguish three empty results — nothing implements it (graph *has* a hierarchy), the indexer emits no implementation relationships (`rust-analyzer`), and the graph is Tree-sitter so the question is unanswerable. `ArborGraph::has_inheritance_edges` is what separates them, and the JSON carries `hierarchyAvailable` so a tool cannot re-derive the mistake from a list length. An interface with four implementations reported as "no implementors" is how someone deletes it.
 - **SCIP edges bypass name resolution**: `PinnedEdge` endpoints are node IDs, applied after `resolve_edges()`. A compiler-resolved edge routed through name matching would lose the only thing that makes it better than a guess.
 - **Indexer knowledge is a table, not a hierarchy**: `arbor-cli/src/indexers.rs` holds one row per indexer — binary name, root markers, arguments, install hint, and an optional retry rule. Adding a language is one row; a wrong row breaks exactly one project type, and breaks it by printing an install command rather than by guessing. `scip_pipeline.rs` knows only how to run one, retry it if its own rule says so, and collect what it produced.
 - **A polyglot repo runs every indexer that matches**: indexes are collected into `.arbor/scip-indexes/` before ingest, because all of these tools write `index.scip` by default (two indexers would overwrite each other) and because `gradlew clean` deletes `build/`, which would destroy what `.arbor/scip.json` points at. An indexer that fails does not block the others — its language is reported as missing rather than silently absent, since "not indexed" and "nothing calls this" are indistinguishable in a graph. Markers are matched at the repo root only, or `arbor scip` would start a compile for every vendored fixture.
@@ -150,6 +151,7 @@ Local cache created by `arbor init`/`arbor setup`. Contains `config.json` with d
 | `query "name" .` | Fuzzy symbol search (supports `\|` for OR) |
 | `callers "sym" .` | Who calls this? |
 | `callees "sym" .` | What does this call? |
+| `implementors "sym" .` | Who implements/extends this? (alias: `subclasses`; needs a SCIP graph) |
 | `entry-points .` | HTTP handlers, main, jobs, webhooks |
 | `file-graph "path" .` | Symbols + edges in one file |
 | `inspect "sym" .` | Full symbol detail |

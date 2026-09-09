@@ -344,6 +344,31 @@ enum Commands {
         json: bool,
     },
 
+    /// Show the types that implement or extend a symbol
+    ///
+    /// Reads the type hierarchy, which only a compiler index carries:
+    /// Tree-sitter cannot resolve `class Middle(Base)` into an edge. On a graph
+    /// with no hierarchy Arbor says so explicitly rather than reporting an empty
+    /// result, because "nothing implements this" and "this graph cannot answer
+    /// that" are different answers.
+    #[command(visible_alias = "subclasses")]
+    Implementors {
+        /// The interface, trait, or class to look up
+        symbol: String,
+
+        /// Path to analyze (defaults to current directory)
+        #[arg(default_value = ".")]
+        path: PathBuf,
+
+        /// Follow the hierarchy to the concrete leaves, not just direct children
+        #[arg(long)]
+        transitive: bool,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Show direct callees of a symbol (what does this call?)
     Callees {
         /// The symbol to look up
@@ -661,6 +686,12 @@ async fn main() {
         } => commands::audit(&sink, depth, &format, &path),
         Commands::Callers { symbol, path, json } => commands::callers(&symbol, &path, json),
         Commands::Callees { symbol, path, json } => commands::callees(&symbol, &path, json),
+        Commands::Implementors {
+            symbol,
+            path,
+            transitive,
+            json,
+        } => commands::implementors(&symbol, &path, transitive, json),
         Commands::EntryPoints { path, json } => commands::entry_points(&path, json),
         Commands::FileGraph { file, path, json } => commands::file_graph(&file, &path, json),
         Commands::Inspect { symbol, path, json } => commands::inspect(&symbol, &path, json),

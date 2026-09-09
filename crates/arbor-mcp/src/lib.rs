@@ -495,6 +495,19 @@ impl McpServer {
                     "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }
                 },
                 {
+                    "name": "get_implementors",
+                    "description": "Returns the types that implement or extend a symbol — subclasses of a class, implementations of an interface or trait. Ask this BEFORE changing an interface method: its implementations do not call it, so get_callers will not find them. Requires a graph built from a compiler index (SCIP); on a Tree-sitter graph the response says the hierarchy is unavailable rather than returning an empty list, so an empty result must never be read as 'nothing implements this' without checking hierarchyAvailable.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "symbol": { "type": "string", "description": "Name or ID of the interface, trait, or class" },
+                            "transitive": { "type": "boolean", "description": "Follow the hierarchy to the concrete leaves (default false)" }
+                        },
+                        "required": ["symbol"]
+                    },
+                    "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }
+                },
+                {
                     "name": "get_callees",
                     "description": "Returns the direct callees of a symbol (one hop downstream). Use to answer 'what does this function call?'",
                     "inputSchema": {
@@ -912,6 +925,85 @@ impl McpServer {
                                 json!({ "node_id": resolved_id })
                             } else {
                                 json!({ "query": symbol })
+                            },
+                        ))
+                    }
+                }
+            }
+            "get_implementors" => {
+                let symbol = arguments
+                    .get("symbol")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let transitive = arguments
+                    .get("transitive")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let graph = self.graph.read().await;
+                let resolved = graph
+                    .get_index(symbol)
+                    .map(|idx| (symbol.to_string(), idx))
+                    .or_else(|| {
+                        graph
+                            .resolve_symbol(symbol)
+                            .and_then(|idx| graph.get(idx).map(|n| (n.id.clone(), idx)))
+                    });
+                match resolved {
+                    None => Ok(Self::err_envelope(
+                        "get_implementors",
+                        &format!("Symbol '{}' not found", symbol),
+                    )),
+                    Some((resolved_id, idx)) => {
+                        let found: Vec<(&arbor_core::CodeNode, usize)> = match transitive {
+                            true => graph.implementors_transitive(idx, 4),
+                            false => graph
+                                .implementors(idx)
+                                .into_iter()
+                                .map(|node| (node, 1))
+                                .collect(),
+                        };
+                        // Reported alongside the list, never inferred from its
+                        // length: an agent that reads an empty list as "nothing
+                        // implements this" will change an interface out from
+                        // under four classes.
+                        let hierarchy_available = graph.has_inheritance_edges();
+                        let items: Vec<Value> = found
+                            .iter()
+                            .map(|(n, depth)| {
+                                json!({
+                                    "id": n.id,
+                                    "name": n.name,
+                                    "qualifiedName": n.qualified_name,
+                                    "kind": n.kind.to_string(),
+                                    "file": n.file,
+                                    "line": n.line_start,
+                                    "depth": depth
+                                })
+                            })
+                            .collect();
+                        let count = items.len();
+                        let note = match (count, hierarchy_available) {
+                            (0, false) => "This graph carries no type hierarchy, so this question cannot be answered from it. Build one with `arbor scip <index.scip>`; a Tree-sitter graph never has inheritance edges, and some SCIP indexers (rust-analyzer) emit none either.",
+                            (0, true) => "Nothing in this repository implements or extends the symbol. The graph does carry a hierarchy, so in-repo implementors are accounted for; external subclasses are not visible.",
+                            _ => "Implementations do not call the symbol they implement, so these will not appear in get_callers.",
+                        };
+                        Ok(Self::ok_envelope(
+                            "get_implementors",
+                            json!({
+                                "symbol": symbol,
+                                "transitive": transitive,
+                                "hierarchyAvailable": hierarchy_available,
+                                "implementors": items,
+                                "note": note
+                            }),
+                            count,
+                            match count > 0 {
+                                true => "analyze_impact",
+                                false => "get_callers",
+                            },
+                            match count > 0 {
+                                true => json!({ "node_id": resolved_id }),
+                                false => json!({ "symbol": symbol }),
                             },
                         ))
                     }

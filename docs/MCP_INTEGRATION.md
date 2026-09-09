@@ -208,7 +208,7 @@ Examples:
 
 ## Available Tools
 
-Sixteen tools in three tiers. Tools added after v2.1.0 and not covered by the
+Seventeen tools in three tiers. Tools added after v2.1.0 and not covered by the
 tables below:
 
 | Tool | Tier | Purpose |
@@ -238,6 +238,7 @@ Errors return `{ "ok": false, "error": "..." }`.
 | `list_entry_points` | Returns all production entry points (main, HTTP handlers, webhooks, jobs, CLI commands) |
 | `get_callers` | Returns all nodes that call a given symbol |
 | `get_callees` | Returns all nodes called by a given symbol |
+| `get_implementors` | Returns the types that implement or extend a symbol. Requires a SCIP-built graph; the response carries `hierarchyAvailable` so an empty list is never mistaken for "nothing implements this" |
 | `search_symbols` | Fuzzy search across all symbol names |
 | `get_file_graph` | Returns all nodes and intra-file edges for a given file path |
 | `get_node_detail` | Returns full detail for a node by ID or name |

@@ -317,6 +317,90 @@ impl ArborGraph {
             .collect()
     }
 
+    /// Types that implement or extend this one, directly.
+    ///
+    /// Incoming `Implements`/`Extends` edges. Kept separate from
+    /// [`Self::get_callers`] because an implementor is not a caller: an interface
+    /// method's implementations do not call it, they *are* it, and folding the
+    /// two together would make blast radius double-count the hierarchy.
+    pub fn implementors(&self, index: NodeId) -> Vec<&CodeNode> {
+        self.graph
+            .neighbors_directed(index, petgraph::Direction::Incoming)
+            .filter_map(|idx| {
+                let edge_idx = self.graph.find_edge(idx, index)?;
+                let edge = self.graph.edge_weight(edge_idx)?;
+                match is_inheritance(edge.kind) {
+                    true => self.graph.node_weight(idx),
+                    false => None,
+                }
+            })
+            .collect()
+    }
+
+    /// Types that implement or extend this one, at any depth.
+    ///
+    /// Interface → abstract base → concrete class is three levels and entirely
+    /// ordinary, and the answer usually wanted is the concrete leaves. Returned
+    /// breadth-first with each node's distance, so a caller can present the
+    /// hierarchy rather than a flat list.
+    ///
+    /// `max_depth` bounds a hierarchy that is cyclic in a malformed index rather
+    /// than trusting it to terminate.
+    pub fn implementors_transitive(
+        &self,
+        index: NodeId,
+        max_depth: usize,
+    ) -> Vec<(&CodeNode, usize)> {
+        let mut seen: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
+        seen.insert(index);
+
+        let mut frontier = vec![index];
+        let mut out = Vec::new();
+
+        for depth in 1..=max_depth {
+            let mut next = Vec::new();
+            for current in frontier {
+                for idx in self
+                    .graph
+                    .neighbors_directed(current, petgraph::Direction::Incoming)
+                {
+                    let Some(edge_idx) = self.graph.find_edge(idx, current) else {
+                        continue;
+                    };
+                    let Some(edge) = self.graph.edge_weight(edge_idx) else {
+                        continue;
+                    };
+                    if !is_inheritance(edge.kind) || !seen.insert(idx) {
+                        continue;
+                    }
+                    if let Some(node) = self.graph.node_weight(idx) {
+                        out.push((node, depth));
+                        next.push(idx);
+                    }
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            frontier = next;
+        }
+
+        out
+    }
+
+    /// Whether this graph contains any inheritance edge at all.
+    ///
+    /// The difference between "nothing implements this" and "this graph cannot
+    /// answer that question". Tree-sitter emits no inheritance edges, and neither
+    /// does every SCIP indexer — `rust-analyzer` emits no `is_implementation`
+    /// relationships — so an empty result has two very different meanings and a
+    /// caller must be able to tell them apart.
+    pub fn has_inheritance_edges(&self) -> bool {
+        (&self.graph)
+            .edge_references()
+            .any(|edge| is_inheritance(edge.weight().kind))
+    }
+
     /// Gets nodes that this node calls.
     pub fn get_callees(&self, index: NodeId) -> Vec<&CodeNode> {
         self.graph
@@ -920,6 +1004,11 @@ fn qualified_name_ends_with(qualified_name: &str, suffix: &str) -> bool {
     head.ends_with('.') || head.ends_with("::") || head.ends_with('#') || head.ends_with('/')
 }
 
+/// Whether an edge expresses a type hierarchy.
+fn is_inheritance(kind: EdgeKind) -> bool {
+    matches!(kind, EdgeKind::Implements | EdgeKind::Extends)
+}
+
 /// Kinds a user means when they ask "who calls this".
 ///
 /// Used only to break a tie between candidates that are otherwise
@@ -1055,5 +1144,101 @@ mod resolution_tests {
 
         let ranked = graph.resolve_symbol_ranked("handler");
         assert_eq!(graph.get(ranked[0]).unwrap().qualified_name, "App.handler");
+    }
+}
+
+#[cfg(test)]
+mod inheritance_tests {
+    use super::*;
+    use arbor_core::NodeKind;
+
+    fn node(qualified: &str, kind: NodeKind) -> CodeNode {
+        let name = qualified.rsplit('.').next().unwrap_or(qualified);
+        CodeNode::new(name, qualified, kind, "x.java").with_lines(1, 1)
+    }
+
+    /// Interface → abstract base → two concrete classes.
+    fn hierarchy() -> (ArborGraph, NodeId) {
+        let mut graph = ArborGraph::new();
+        let gateway = graph.add_node(node("Gateway", NodeKind::Interface));
+        let base = graph.add_node(node("AbstractGateway", NodeKind::Class));
+        let stripe = graph.add_node(node("StripeGateway", NodeKind::Class));
+        let paypal = graph.add_node(node("PaypalGateway", NodeKind::Class));
+
+        graph.add_edge(base, gateway, Edge::new(EdgeKind::Implements));
+        graph.add_edge(stripe, base, Edge::new(EdgeKind::Extends));
+        graph.add_edge(paypal, base, Edge::new(EdgeKind::Extends));
+        // A call edge must not be mistaken for a hierarchy edge.
+        let checkout = graph.add_node(node("Checkout", NodeKind::Class));
+        graph.add_edge(checkout, gateway, Edge::new(EdgeKind::Calls));
+
+        (graph, gateway)
+    }
+
+    #[test]
+    fn direct_implementors_exclude_callers() {
+        let (graph, gateway) = hierarchy();
+        let names: Vec<&str> = graph
+            .implementors(gateway)
+            .iter()
+            .map(|n| n.qualified_name.as_str())
+            .collect();
+        assert_eq!(names, vec!["AbstractGateway"]);
+    }
+
+    #[test]
+    fn transitive_implementors_reach_the_concrete_leaves() {
+        let (graph, gateway) = hierarchy();
+        let mut found: Vec<(String, usize)> = graph
+            .implementors_transitive(gateway, 4)
+            .into_iter()
+            .map(|(n, d)| (n.qualified_name.clone(), d))
+            .collect();
+        found.sort();
+
+        assert_eq!(
+            found,
+            vec![
+                ("AbstractGateway".to_string(), 1),
+                ("PaypalGateway".to_string(), 2),
+                ("StripeGateway".to_string(), 2),
+            ]
+        );
+    }
+
+    #[test]
+    fn depth_is_bounded() {
+        let (graph, gateway) = hierarchy();
+        let found = graph.implementors_transitive(gateway, 1);
+        assert_eq!(found.len(), 1, "depth 1 is the direct implementors only");
+    }
+
+    #[test]
+    fn a_cycle_terminates() {
+        // A malformed index can claim A implements B and B implements A.
+        let mut graph = ArborGraph::new();
+        let a = graph.add_node(node("A", NodeKind::Class));
+        let b = graph.add_node(node("B", NodeKind::Class));
+        graph.add_edge(a, b, Edge::new(EdgeKind::Implements));
+        graph.add_edge(b, a, Edge::new(EdgeKind::Implements));
+
+        let found = graph.implementors_transitive(a, 16);
+        assert_eq!(found.len(), 1, "each node is visited once");
+    }
+
+    #[test]
+    fn a_graph_without_hierarchy_says_so() {
+        // The distinction between "nothing implements this" and "this graph
+        // cannot answer that".
+        let mut graph = ArborGraph::new();
+        let a = graph.add_node(node("A", NodeKind::Class));
+        let b = graph.add_node(node("B", NodeKind::Class));
+        graph.add_edge(b, a, Edge::new(EdgeKind::Calls));
+
+        assert!(!graph.has_inheritance_edges());
+        assert!(graph.implementors(a).is_empty());
+
+        let (with_hierarchy, _) = hierarchy();
+        assert!(with_hierarchy.has_inheritance_edges());
     }
 }

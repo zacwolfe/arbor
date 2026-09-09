@@ -4492,6 +4492,139 @@ fn report_symbol_ambiguity(
     eprintln!("      Pass a qualified name (e.g. Class.method) to pick a specific one.");
 }
 
+/// How deep a type hierarchy is worth walking.
+///
+/// Matches the dispatch expansion's own bound: interface → abstract base →
+/// concrete class is three, and past four the answer is a taxonomy rather than a
+/// question anyone asked.
+const MAX_HIERARCHY_DEPTH: usize = 4;
+
+/// Shows what implements or extends a symbol.
+///
+/// The interesting part is not the traversal, it is the empty result. Only a
+/// compiler index carries a type hierarchy, so on a Tree-sitter graph the honest
+/// answer is "this graph has no inheritance edges", never "nothing implements
+/// this" — and some SCIP indexers (`rust-analyzer`) emit no implementation
+/// relationships either. Reporting those two as "none found" would be the same
+/// absence-as-evidence mistake `refactor` used to make, in a place where a user
+/// is deciding whether an interface is safe to change.
+pub fn implementors(symbol: &str, path: &Path, transitive: bool, json_output: bool) -> Result<()> {
+    let resolved_path = resolve_project_path(path)?;
+    let graph = load_or_index_graph(&resolved_path)?;
+
+    let (idx, ambiguous_with) = resolve_symbol_ranked(&graph, symbol)?;
+    if !json_output {
+        report_symbol_ambiguity(&graph, symbol, idx, &ambiguous_with);
+    }
+
+    let found: Vec<(&arbor_core::CodeNode, usize)> = match transitive {
+        true => graph.implementors_transitive(idx, MAX_HIERARCHY_DEPTH),
+        false => graph
+            .implementors(idx)
+            .into_iter()
+            .map(|node| (node, 1))
+            .collect(),
+    };
+
+    // Computed even when results exist, because the JSON consumer needs to know
+    // how much an empty list is worth without re-deriving it.
+    let hierarchy_available = graph.has_inheritance_edges();
+    let provenance = match arbor_graph::cache::is_scip_provenanced(&resolved_path) {
+        true => "scip",
+        false => "tree-sitter",
+    };
+
+    if json_output {
+        let items: Vec<serde_json::Value> = found
+            .iter()
+            .map(|(n, depth)| {
+                serde_json::json!({
+                    "id": n.id,
+                    "name": n.name,
+                    "qualifiedName": n.qualified_name,
+                    "kind": n.kind.to_string(),
+                    "file": n.file,
+                    "line": n.line_start,
+                    "depth": depth
+                })
+            })
+            .collect();
+
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "symbol": symbol,
+                "transitive": transitive,
+                "provenance": provenance,
+                "hierarchyAvailable": hierarchy_available,
+                "implementors": items
+            }))?
+        );
+        return Ok(());
+    }
+
+    if found.is_empty() {
+        report_no_implementors(symbol, hierarchy_available, provenance);
+        return Ok(());
+    }
+
+    println!("Implementors of '{}' ({}):\n", symbol, found.len());
+    for (node, depth) in &found {
+        let indent = "  ".repeat(*depth);
+        println!(
+            "{}{} {} {}",
+            indent,
+            node.kind.to_string().yellow(),
+            node.qualified_name.cyan(),
+            format!("({}:{})", node.file, node.line_start).dimmed()
+        );
+    }
+
+    if !transitive {
+        println!(
+            "\n  {}",
+            "Only direct implementors. Use --transitive for the concrete leaves.".dimmed()
+        );
+    }
+
+    Ok(())
+}
+
+/// Explains an empty implementor list without claiming there are none.
+///
+/// Three distinct situations, and collapsing them into "none found" is what makes
+/// a user delete an interface that four classes implement.
+fn report_no_implementors(symbol: &str, hierarchy_available: bool, provenance: &str) {
+    if hierarchy_available {
+        println!("Nothing implements or extends '{}'.", symbol);
+        println!(
+            "  {}",
+            "This graph carries a type hierarchy, so in-repo implementors are \
+accounted for. External subclasses are still invisible."
+                .dimmed()
+        );
+        return;
+    }
+
+    println!(
+        "{} This graph has no type hierarchy, so this question cannot be answered from it.",
+        "⚠".yellow()
+    );
+
+    let reason = match provenance {
+        "scip" => format!(
+            "The indexer that produced it emits no implementation relationships — \
+rust-analyzer is one such. That is not evidence that '{symbol}' has no implementors."
+        ),
+        _ => format!(
+            "It was built by Tree-sitter, which cannot resolve `class Middle(Base)` into \
+an edge, so '{symbol}' would look unimplemented either way. A compiler index carries the \
+hierarchy: arbor scip <index.scip>"
+        ),
+    };
+    println!("  {}", reason.dimmed());
+}
+
 pub fn callers(symbol: &str, path: &Path, json_output: bool) -> Result<()> {
     let resolved_path = resolve_project_path(path)?;
     let graph = load_or_index_graph(&resolved_path)?;
