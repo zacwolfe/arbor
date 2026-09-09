@@ -50,7 +50,7 @@ while [[ $# -gt 0 ]]; do
       done
       ;;
     -h|--help)
-      sed -n '3,25p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '3,22p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     *)

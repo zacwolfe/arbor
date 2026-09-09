@@ -20,8 +20,18 @@
 
 set -euo pipefail
 
-# Resolved before any cd, so delegation still works with a relative --root.
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Resolved before any cd, so delegation still works with a relative --root, and
+# through symlinks, since this script is commonly linked into a bin directory —
+# the sibling ingest script lives next to the real file, not next to the link.
+SCRIPT_PATH="${BASH_SOURCE[0]}"
+while [[ -L "$SCRIPT_PATH" ]]; do
+  link_target="$(readlink "$SCRIPT_PATH")"
+  case "$link_target" in
+    /*) SCRIPT_PATH="$link_target" ;;
+    *) SCRIPT_PATH="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)/$link_target" ;;
+  esac
+done
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 INGEST_SCRIPT="$SCRIPT_DIR/arbor-scip-ingest.sh"
 
 NO_INGEST="false"
@@ -90,7 +100,7 @@ run() {
 
 if [[ "$BACKGROUND" == "true" ]]; then
   LOGFILE="${TMPDIR:-/tmp}/arbor-scip-$(date +%Y%m%d-%H%M%S).log"
-  nohup "$SCRIPT_DIR/$(basename "$0")" ${FORWARD[@]+"${FORWARD[@]}"} \
+  nohup "$SCRIPT_PATH" ${FORWARD[@]+"${FORWARD[@]}"} \
     >"$LOGFILE" 2>&1 &
   echo "Started in background: pid $!"
   echo "  log:    $LOGFILE"
@@ -108,8 +118,18 @@ command -v scip-java >/dev/null 2>&1 \
 
 cd "$PROJECT_ROOT" || die "cannot cd to $PROJECT_ROOT"
 
-if [[ ! -f build.gradle && ! -f build.gradle.kts && ! -f pom.xml && ! -f build.sbt ]]; then
-  die "no build.gradle/.kts, pom.xml, or build.sbt here. Run this from the project root."
+# Only Gradle and Maven. scip-java's `index` detects nothing else — its
+# --build-tool flag takes `gradle`, and Maven is auto-detected. Accepting
+# build.sbt here used to let an sbt project through to a "No build tool
+# detected" failure, followed by a second, misleading error from the retry
+# logic below when it found no build command to reconstruct.
+if [[ -f build.sbt ]] && [[ ! -f build.gradle && ! -f build.gradle.kts && ! -f pom.xml ]]; then
+  die "this is an sbt project, which scip-java cannot index (Gradle and Maven only).
+Arbor also has no Scala parser, so there is no Tree-sitter fallback either."
+fi
+
+if [[ ! -f build.gradle && ! -f build.gradle.kts && ! -f pom.xml ]]; then
+  die "no build.gradle, build.gradle.kts, or pom.xml here. Run this from the project root."
 fi
 
 if [[ "$NO_INGEST" == "false" ]] && ! command -v arbor >/dev/null 2>&1; then
@@ -139,6 +159,13 @@ if [[ "$rc" -ne 0 ]]; then
 
   # scip-java echoes the build command it ran, prefixed with '$'. The task
   # list is the trailing run of tokens that are neither options nor paths.
+  # scip-java never got as far as running a build, so there is no command to
+  # reconstruct and the retry logic has nothing to say. Report its reason
+  # instead of adding a second, unrelated-looking error on top.
+  if grep -qi "No build tool detected" "$LOG"; then
+    die "scip-java found no build tool it supports (Gradle or Maven) in $(pwd)."
+  fi
+
   BUILD_LINE="$(grep -m1 '^\$ ' "$LOG" | sed 's/^\$ //' || true)"
   [[ -n "$BUILD_LINE" ]] \
     || die "could not find scip-java's build command in its output; nothing to reconstruct.
