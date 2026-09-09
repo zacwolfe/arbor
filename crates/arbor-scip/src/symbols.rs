@@ -191,6 +191,7 @@ fn vertex_descriptors(symbol: &str) -> Option<Vec<Descriptor>> {
     suffix_to_kind(
         last.suffix.enum_value().ok()?,
         &last.name,
+        &descriptors,
         &SymbolStyle::default(),
     )?;
 
@@ -206,7 +207,12 @@ pub fn parse(symbol: &str, style: &SymbolStyle) -> Option<SymbolFacts> {
     let descriptors = vertex_descriptors(symbol)?;
     let last = descriptors.last()?;
 
-    let kind = suffix_to_kind(last.suffix.enum_value().ok()?, &last.name, style)?;
+    let kind = suffix_to_kind(
+        last.suffix.enum_value().ok()?,
+        &last.name,
+        &descriptors,
+        style,
+    )?;
 
     let named = strip_file_path_prefix(&descriptors);
     let mut qualified_name = scope_names(named, style).join(style.separator);
@@ -315,13 +321,46 @@ fn looks_like_source_file(name: &str) -> bool {
         .is_some_and(|(stem, ext)| !stem.is_empty() && arbor_core::languages::is_supported(ext))
 }
 
+/// Whether the scope directly containing the last descriptor is a type.
+///
+/// Type parameters, parameters and metadata are skipped: `rust-analyzer` writes
+/// an inherent method as `impl#[ArborGraph]method()`, so the descriptor
+/// immediately before the method is a *type parameter* and the enclosing type is
+/// one step further back.
+fn encloses_a_type(descriptors: &[Descriptor]) -> bool {
+    descriptors
+        .iter()
+        .rev()
+        .skip(1)
+        .filter(|d| {
+            !matches!(
+                d.suffix.enum_value(),
+                Ok(Suffix::TypeParameter) | Ok(Suffix::Parameter) | Ok(Suffix::Meta)
+            )
+        })
+        .map(|d| d.suffix.enum_value())
+        .next()
+        .is_some_and(|suffix| matches!(suffix, Ok(Suffix::Type)))
+}
+
 /// Maps a descriptor suffix to a node kind.
 ///
 /// `None` means "not a graph vertex".
-fn suffix_to_kind(suffix: Suffix, name: &str, style: &SymbolStyle) -> Option<NodeKind> {
+fn suffix_to_kind(
+    suffix: Suffix,
+    name: &str,
+    descriptors: &[Descriptor],
+    style: &SymbolStyle,
+) -> Option<NodeKind> {
     match suffix {
         Suffix::Method if style.ctor_names.contains(&name) => Some(NodeKind::Constructor),
-        Suffix::Method => Some(NodeKind::Method),
+        // SCIP spells a free function and a method identically — both are `()`.
+        // What separates them is the enclosing scope: a method hangs off a type,
+        // a function off a namespace or package. Without this, every top-level
+        // Python, Go and Rust function is reported as a `method`, which is both
+        // wrong and makes ambiguous-name output unreadable.
+        Suffix::Method if encloses_a_type(descriptors) => Some(NodeKind::Method),
+        Suffix::Method => Some(NodeKind::Function),
         Suffix::Type => Some(NodeKind::Class),
         Suffix::Term => Some(NodeKind::Field),
         Suffix::Namespace | Suffix::Package => Some(NodeKind::Module),
@@ -501,6 +540,56 @@ mod tests {
         )
         .unwrap();
         assert_eq!(facts.qualified_name, "app.svc.UserService.find");
+    }
+
+    #[test]
+    fn a_module_level_function_is_not_a_method() {
+        // SCIP spells both as `()`. Python's `def resolve_edge` at module level
+        // was being reported as a method, which is wrong and makes an ambiguous
+        // name impossible to read.
+        let style = style_for("Python", None);
+        let facts = parse(
+            "scip-python python app 1.0 dedupe_edges/resolve_edge().",
+            &style,
+        )
+        .unwrap();
+        assert_eq!(facts.kind, NodeKind::Function);
+        assert_eq!(facts.qualified_name, "dedupe_edges.resolve_edge");
+    }
+
+    #[test]
+    fn a_method_on_a_type_is_still_a_method() {
+        let style = style_for("Python", None);
+        let facts = parse(
+            "scip-python python app 1.0 app/svc/UserService#find().",
+            &style,
+        )
+        .unwrap();
+        assert_eq!(facts.kind, NodeKind::Method);
+    }
+
+    #[test]
+    fn a_rust_inherent_method_survives_the_impl_indirection() {
+        // The descriptor before the method is a type *parameter*, so a naive
+        // "is my parent a type" check would call this a free function.
+        let style = style_for("Rust", None);
+        let facts = parse(
+            "rust-analyzer cargo arbor 0.1.0 graph/impl#[ArborGraph]add_edge().",
+            &style,
+        )
+        .unwrap();
+        assert_eq!(facts.kind, NodeKind::Method);
+    }
+
+    #[test]
+    fn a_rust_free_function_is_a_function() {
+        let style = style_for("Rust", None);
+        let facts = parse(
+            "rust-analyzer cargo arbor 0.1.0 graph/resolve_edges().",
+            &style,
+        )
+        .unwrap();
+        assert_eq!(facts.kind, NodeKind::Function);
     }
 
     #[test]

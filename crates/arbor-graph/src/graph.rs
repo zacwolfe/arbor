@@ -180,6 +180,14 @@ impl ArborGraph {
             .filter_map(|n| self.get_index(&n.id))
             .collect();
 
+        // The simple-name index is keyed on `name`, so a qualified name misses
+        // it entirely. That made the ambiguity note's own advice — "pass a
+        // qualified name to pick a specific one" — impossible to follow: every
+        // name it printed came back "not found".
+        if candidates.is_empty() {
+            candidates = self.resolve_by_qualified_name(name);
+        }
+
         candidates.sort_by(|&a, &b| {
             let degree = |i: NodeId| self.get_callers(i).len() + self.get_callees(i).len();
             degree(b)
@@ -189,6 +197,15 @@ impl ArborGraph {
                         .partial_cmp(&self.centrality(a))
                         .unwrap_or(std::cmp::Ordering::Equal)
                 })
+                // With every candidate equally unconnected — common for a name
+                // that is both a type annotation and a function — degree and
+                // centrality decide nothing, and picking a field over the
+                // function of the same name is never what was meant.
+                .then_with(|| {
+                    let callable =
+                        |i: NodeId| self.get(i).is_some_and(|n| is_callable_kind(n.kind));
+                    callable(b).cmp(&callable(a))
+                })
                 .then_with(|| {
                     let file = |i: NodeId| self.get(i).map(|n| n.file.clone()).unwrap_or_default();
                     file(a).cmp(&file(b))
@@ -196,6 +213,37 @@ impl ArborGraph {
         });
 
         candidates
+    }
+
+    /// Candidates whose qualified name is, or ends with, `name`.
+    ///
+    /// A suffix match is what makes `Prompt.resolve_edge` find
+    /// `dedupe_edges.Prompt.resolve_edge` without the user having to know the
+    /// module prefix. The boundary check is what stops `Edge` from matching
+    /// `ResolvedEdge` — a suffix that shares no scope is a different symbol.
+    fn resolve_by_qualified_name(&self, name: &str) -> Vec<NodeId> {
+        let exact: Vec<NodeId> = self
+            .graph
+            .node_indices()
+            .filter(|idx| {
+                self.graph
+                    .node_weight(*idx)
+                    .is_some_and(|n| n.qualified_name == name)
+            })
+            .collect();
+
+        if !exact.is_empty() {
+            return exact;
+        }
+
+        self.graph
+            .node_indices()
+            .filter(|idx| {
+                self.graph
+                    .node_weight(*idx)
+                    .is_some_and(|n| qualified_name_ends_with(&n.qualified_name, name))
+            })
+            .collect()
     }
 
     /// The single node a user most likely meant by `name`.
@@ -856,4 +904,156 @@ fn index_node_documentation(index: &mut SearchIndex, node: &CodeNode, id: NodeId
 /// joining a user-supplied relative path.
 fn normalize_separators(path: &str) -> String {
     path.replace('\\', "/")
+}
+
+/// Whether `qualified_name` ends with `suffix` at a scope boundary.
+///
+/// `Prompt.resolve_edge` matches `dedupe_edges.Prompt.resolve_edge`;
+/// `Edge` does not match `ResolvedEdge`. Both `.` and `::` are accepted so the
+/// same check serves Python, Java and TypeScript names alongside Rust and C++
+/// ones — the separator is a language's spelling, not a different concept.
+fn qualified_name_ends_with(qualified_name: &str, suffix: &str) -> bool {
+    let Some(head) = qualified_name.strip_suffix(suffix) else {
+        return false;
+    };
+
+    head.ends_with('.') || head.ends_with("::") || head.ends_with('#') || head.ends_with('/')
+}
+
+/// Kinds a user means when they ask "who calls this".
+///
+/// Used only to break a tie between candidates that are otherwise
+/// indistinguishable, so it deliberately does not include types.
+fn is_callable_kind(kind: arbor_core::NodeKind) -> bool {
+    use arbor_core::NodeKind;
+    matches!(
+        kind,
+        NodeKind::Function | NodeKind::Method | NodeKind::Constructor
+    )
+}
+
+#[cfg(test)]
+mod resolution_tests {
+    use super::*;
+    use arbor_core::NodeKind;
+
+    fn node(name: &str, qualified: &str, kind: NodeKind, file: &str, line: u32) -> CodeNode {
+        CodeNode::new(name, qualified, kind, file).with_lines(line, line)
+    }
+
+    /// The zep_config case: `resolve_edge` is two TypedDict fields and one
+    /// module-level function, none of them connected.
+    fn ambiguous_graph() -> ArborGraph {
+        let mut graph = ArborGraph::new();
+        graph.add_node(node(
+            "resolve_edge",
+            "dedupe_edges.Prompt.resolve_edge",
+            NodeKind::Field,
+            "dedupe_edges.py",
+            36,
+        ));
+        graph.add_node(node(
+            "resolve_edge",
+            "dedupe_edges.Versions.resolve_edge",
+            NodeKind::Field,
+            "dedupe_edges.py",
+            40,
+        ));
+        graph.add_node(node(
+            "resolve_edge",
+            "dedupe_edges.resolve_edge",
+            NodeKind::Function,
+            "dedupe_edges.py",
+            43,
+        ));
+        graph
+    }
+
+    #[test]
+    fn a_qualified_name_resolves() {
+        // The ambiguity note prints these; passing one back must work.
+        let graph = ambiguous_graph();
+        let found = graph.resolve_symbol_ranked("dedupe_edges.Versions.resolve_edge");
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            graph.get(found[0]).unwrap().kind,
+            NodeKind::Field,
+            "must pick the exact node named, not the most appealing one"
+        );
+    }
+
+    #[test]
+    fn a_partial_qualified_name_resolves_at_a_scope_boundary() {
+        let graph = ambiguous_graph();
+        let found = graph.resolve_symbol_ranked("Prompt.resolve_edge");
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            graph.get(found[0]).unwrap().qualified_name,
+            "dedupe_edges.Prompt.resolve_edge"
+        );
+    }
+
+    #[test]
+    fn a_suffix_that_is_not_a_scope_boundary_does_not_match() {
+        let mut graph = ArborGraph::new();
+        graph.add_node(node(
+            "ResolvedEdge",
+            "edges.ResolvedEdge",
+            NodeKind::Class,
+            "edges.py",
+            1,
+        ));
+        assert!(graph.resolve_symbol_ranked("Edge").is_empty());
+    }
+
+    #[test]
+    fn rust_paths_resolve_too() {
+        let mut graph = ArborGraph::new();
+        graph.add_node(node(
+            "add_edge",
+            "graph::ArborGraph::add_edge",
+            NodeKind::Method,
+            "graph.rs",
+            1,
+        ));
+        assert_eq!(
+            graph
+                .resolve_symbol_ranked("graph::ArborGraph::add_edge")
+                .len(),
+            1
+        );
+        assert_eq!(
+            graph.resolve_symbol_ranked("ArborGraph::add_edge").len(),
+            1,
+            "a `::` boundary counts the same as a `.` one"
+        );
+    }
+
+    #[test]
+    fn an_unconnected_tie_prefers_the_callable() {
+        // Previously this picked a TypedDict field over the function of the same
+        // name, then reported it isolated — which it genuinely is.
+        let graph = ambiguous_graph();
+        let ranked = graph.resolve_symbol_ranked("resolve_edge");
+        assert_eq!(ranked.len(), 3);
+        assert_eq!(
+            graph.get(ranked[0]).unwrap().kind,
+            NodeKind::Function,
+            "a field is never what 'who calls resolve_edge' meant"
+        );
+    }
+
+    #[test]
+    fn connectedness_still_outranks_callability() {
+        // A field with real edges beats an unconnected function: the tie-break
+        // must only apply when there is actually a tie.
+        let mut graph = ArborGraph::new();
+        let field = graph.add_node(node("handler", "App.handler", NodeKind::Field, "a.py", 1));
+        graph.add_node(node("handler", "b.handler", NodeKind::Function, "b.py", 1));
+        let caller = graph.add_node(node("main", "main", NodeKind::Function, "c.py", 1));
+        graph.add_edge(caller, field, Edge::new(EdgeKind::Calls));
+
+        let ranked = graph.resolve_symbol_ranked("handler");
+        assert_eq!(graph.get(ranked[0]).unwrap().qualified_name, "App.handler");
+    }
 }
