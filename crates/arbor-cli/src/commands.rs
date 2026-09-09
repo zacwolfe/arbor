@@ -303,8 +303,8 @@ fn auto_rebuild_scip(project_root: &Path, indexes: &[String]) -> Result<()> {
     let detected = crate::indexers::detect(project_root);
     let runnable: Vec<_> = detected
         .iter()
-        .copied()
-        .filter(|i| crate::indexers::on_path(i.binary))
+        .filter(|d| d.is_runnable() && crate::indexers::on_path(d.indexer.binary))
+        .cloned()
         .collect();
 
     if runnable.is_empty() {
@@ -380,10 +380,9 @@ fn auto_rebuild_scip(project_root: &Path, indexes: &[String]) -> Result<()> {
     // better than a stale graph, but only if the user knows which half is which.
     for failed in rebuild.failures() {
         eprintln!(
-            "{} {} failed; {} is missing from the refreshed graph.",
+            "{} {} failed; that module is missing from the refreshed graph.",
             "⚠".yellow(),
-            failed.binary,
-            failed.language
+            failed.label()
         );
     }
 
@@ -414,12 +413,12 @@ fn auto_rebuild_scip(project_root: &Path, indexes: &[String]) -> Result<()> {
 ///
 /// Shared by the `--background` launcher and the worker so a rebuild cannot be
 /// started that the worker will immediately abandon.
-fn runnable_indexers(project_root: &Path) -> Result<Vec<&'static crate::indexers::Indexer>> {
+fn runnable_indexers(project_root: &Path) -> Result<Vec<crate::indexers::Detected>> {
     let detected = crate::indexers::detect(project_root);
     let runnable: Vec<_> = detected
         .iter()
-        .copied()
-        .filter(|i| crate::indexers::on_path(i.binary))
+        .filter(|d| d.is_runnable() && crate::indexers::on_path(d.indexer.binary))
+        .cloned()
         .collect();
 
     if !runnable.is_empty() {
@@ -438,10 +437,11 @@ Already have an index? Ingest it directly: arbor scip <index.scip>",
     }
 
     let mut message = String::from("No matching SCIP indexer is installed. This project needs:\n");
-    for indexer in &detected {
+    for found in &detected {
         message.push_str(&format!(
-            "  {} for {}\n    {}\n",
-            indexer.binary, indexer.language, indexer.install
+            "  {}\n    {}\n",
+            found.label(),
+            found.indexer.install
         ));
     }
     Err(message.into())
@@ -452,7 +452,7 @@ Already have an index? Ingest it directly: arbor scip <index.scip>",
 /// Two distinct situations, and conflating them wastes the user's time: nothing
 /// about the project looks indexable, versus the right indexer exists and is not
 /// installed.
-fn report_no_runnable_indexer(detected: &[&'static crate::indexers::Indexer]) {
+fn report_no_runnable_indexer(detected: &[crate::indexers::Detected]) {
     if detected.is_empty() {
         eprintln!(
             "{} Sources changed, but no SCIP indexer matches this project — serving the \
@@ -468,12 +468,11 @@ Re-run whichever indexer built the index, then: arbor scip <index.scip>",
 cached graph.",
         "⚠".yellow()
     );
-    for indexer in detected {
+    for found in detected {
         eprintln!(
-            "  {} for {}: {}",
-            indexer.binary.cyan(),
-            indexer.language,
-            indexer.install.dimmed()
+            "  {}: {}",
+            found.label().cyan(),
+            found.indexer.install.dimmed()
         );
     }
     eprintln!("  Then: {}", "arbor scip --background".cyan());
@@ -484,15 +483,27 @@ cached graph.",
 /// Silence here would be the worst outcome: the affected code would simply be
 /// absent from the graph, which reads as "nothing calls this" rather than as
 /// "this was never indexed".
-fn report_missing_indexers(missing: &[&'static crate::indexers::Indexer]) {
-    for indexer in missing {
-        eprintln!(
-            "{} {} not installed, so {} is not in the graph. Install: {}",
-            "⚠".yellow(),
-            indexer.binary,
-            indexer.language,
-            indexer.install.dimmed()
-        );
+fn report_missing_indexers(missing: &[crate::indexers::Detected]) {
+    for found in missing {
+        match found.is_runnable() {
+            true => eprintln!(
+                "{} {} is not in the graph — {} is not installed. Install: {}",
+                "⚠".yellow(),
+                found.label(),
+                found.indexer.binary,
+                found.indexer.install.dimmed()
+            ),
+            // Detected, installed, and still not run: Arbor will not drive this
+            // indexer for a subdirectory because it cannot be trusted to emit
+            // root-relative paths. Saying so beats leaving the module absent.
+            false => eprintln!(
+                "{} {} is not in the graph — Arbor cannot drive {} for a \
+subdirectory.\n  Run it yourself from the repository root, then: arbor scip <index.scip>",
+                "⚠".yellow(),
+                found.label(),
+                found.indexer.binary
+            ),
+        }
     }
 }
 
@@ -1689,8 +1700,8 @@ pub fn scip_background_worker(root: &Path, merge: bool, no_dispatch: bool) -> Re
     let detected = crate::indexers::detect(&resolved_path);
     let runnable: Vec<_> = detected
         .iter()
-        .copied()
-        .filter(|i| crate::indexers::on_path(i.binary))
+        .filter(|d| d.is_runnable() && crate::indexers::on_path(d.indexer.binary))
+        .cloned()
         .collect();
 
     if runnable.is_empty() {
@@ -1732,10 +1743,9 @@ pub fn scip_background_worker(root: &Path, merge: bool, no_dispatch: bool) -> Re
 
     for failed in rebuild.failures() {
         eprintln!(
-            "{} {} failed; {} is missing from the refreshed graph.",
+            "{} {} failed; that module is missing from the refreshed graph.",
             "⚠".yellow(),
-            failed.binary,
-            failed.language
+            failed.label()
         );
     }
 

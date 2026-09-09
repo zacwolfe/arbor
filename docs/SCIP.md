@@ -78,6 +78,26 @@ project with a `release.py` at the root runs `rust-analyzer` and nothing else.
 compilation database, so a `.cpp` at the root would promise an index Arbor cannot
 deliver.
 
+**Monorepos are detected one level down.** A Gradle root with a Next.js front
+end in `ui/` and Python helpers in `scripts/` finds all three: markers are
+matched at the root *and* in immediate subdirectories. Depth one deliberately —
+recursing would offer to start an indexer for every vendored fixture and sample
+app in the tree — and `node_modules`, `build`, `target`, `dist`, `vendor`,
+`examples` and hidden directories are skipped.
+
+A submodule is only run when its indexer emits **root-relative** paths given a
+directory, which is verified for `scip-typescript` (`scip-typescript index ui`
+→ `ui/src/...`) and `scip-python` (`scip-python index scripts` →
+`scripts/...`). Run inside the subdirectory instead, an indexer emits paths
+relative to *it*, and ingesting those against the repository root yields a graph
+naming files that do not exist — which breaks `arbor diff`, `file-graph` and
+every "now read this file" follow-up, silently. For the other indexers Arbor
+reports the module and tells you to run it yourself rather than guess.
+
+A build tool detected at the root owns its own submodules: Gradle and Maven
+resolve a multi-module build themselves, so Arbor does not start a second pass
+over one module and fight the first for the build lock.
+
 **A polyglot repository runs every indexer that matches.** A root with both
 `Cargo.toml` and `tsconfig.json` runs `rust-analyzer` and `scip-typescript`,
 collects both indexes into `.arbor/scip-indexes/`, and ingests them together, so

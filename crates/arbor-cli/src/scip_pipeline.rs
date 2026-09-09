@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::SystemTime;
 
-use crate::indexers::Indexer;
+use crate::indexers::{Detected, Indexer};
 
 /// Outcome of one indexer invocation.
 pub struct PipelineRun {
@@ -27,13 +27,18 @@ pub struct PipelineRun {
     pub retried: bool,
 }
 
-/// Runs one indexer, applying its retry rule if the first attempt fails.
+/// Runs one indexer with a prepared argument list, applying its retry rule if
+/// the first attempt fails.
 ///
 /// The first attempt is never skipped in favour of always passing the retry
 /// arguments: on a project that does not need them it succeeds, and a second
 /// full build would be pure waste.
-pub fn run_one(project_root: &Path, indexer: &Indexer) -> std::io::Result<PipelineRun> {
-    let base = indexer.arguments(project_root);
+fn run_with_args(
+    project_root: &Path,
+    indexer: &Indexer,
+    args: &[String],
+) -> std::io::Result<PipelineRun> {
+    let base = args.to_vec();
     let first = invoke(project_root, indexer, &base)?;
     if first.status.success() {
         return Ok(PipelineRun {
@@ -77,13 +82,14 @@ pub struct Rebuild {
     /// Indexes produced by this rebuild, already collected under `.arbor/`.
     pub indexes: Vec<PathBuf>,
 
-    /// Every indexer that ran, and whether it succeeded.
-    pub ran: Vec<(&'static Indexer, PipelineRun)>,
+    /// Every module that ran, and whether it succeeded.
+    pub ran: Vec<(Detected, PipelineRun)>,
 
-    /// Detected but not installed. Reported rather than silently skipped: a
-    /// missing indexer means part of the repository is absent from the graph,
-    /// which looks identical to that code having no callers.
-    pub missing: Vec<&'static Indexer>,
+    /// Detected but not run — the indexer is missing, or Arbor will not drive it
+    /// for a subdirectory. Reported rather than silently skipped: an unindexed
+    /// module is absent from the graph, which looks identical to that code
+    /// having no callers.
+    pub missing: Vec<Detected>,
 
     /// Combined output of every invocation, for the failure log.
     pub log: String,
@@ -99,12 +105,12 @@ impl Rebuild {
         !self.indexes.is_empty()
     }
 
-    /// Indexers that ran and failed.
-    pub fn failures(&self) -> Vec<&'static Indexer> {
+    /// Modules that ran and failed.
+    pub fn failures(&self) -> Vec<Detected> {
         self.ran
             .iter()
             .filter(|(_, run)| !run.success)
-            .map(|(indexer, _)| *indexer)
+            .map(|(detected, _)| detected.clone())
             .collect()
     }
 }
@@ -118,7 +124,7 @@ pub fn rebuild(project_root: &Path) -> std::io::Result<Rebuild> {
     let detected = crate::indexers::detect(project_root);
     let (available, missing): (Vec<_>, Vec<_>) = detected
         .into_iter()
-        .partition(|indexer| crate::indexers::on_path(indexer.binary));
+        .partition(|d| d.is_runnable() && crate::indexers::on_path(d.indexer.binary));
 
     // Previously collected indexes are cleared first so a module that no longer
     // exists cannot leave one behind to be ingested forever.
@@ -131,22 +137,27 @@ pub fn rebuild(project_root: &Path) -> std::io::Result<Rebuild> {
         log: String::new(),
     };
 
-    for indexer in available {
+    for detected in available {
         // Recorded before the run so anything the indexer writes counts as new,
         // even a file it rewrites in place.
         let started = SystemTime::now();
-        let run = run_one(project_root, indexer)?;
+        let Some(args) = detected.arguments(project_root) else {
+            continue;
+        };
+        let run = run_with_args(project_root, detected.indexer, &args)?;
 
         result.log.push_str(&run.output);
         result.log.push('\n');
 
         if run.success {
-            result
-                .indexes
-                .extend(collect_new_indexes(project_root, indexer, started)?);
+            result.indexes.extend(collect_new_indexes(
+                project_root,
+                detected.indexer,
+                started,
+            )?);
         }
 
-        result.ran.push((indexer, run));
+        result.ran.push((detected, run));
     }
 
     Ok(result)

@@ -10,12 +10,16 @@
 //! Adding a language is one row. If a row is wrong, exactly one project type
 //! breaks, and it breaks by printing an install hint rather than by guessing.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Given a failed run's combined output, the extra arguments to retry with.
 pub type RetryRule = fn(&str) -> Option<Vec<String>>;
 
 /// One indexer Arbor can invoke on the user's behalf.
+///
+/// `PartialEq`/`Eq` compare by binary name: every entry is a distinct tool, and
+/// comparing function pointers is neither meaningful nor stable.
+#[derive(Debug)]
 pub struct Indexer {
     /// Executable name, looked up on `PATH`.
     pub binary: &'static str,
@@ -29,8 +33,18 @@ pub struct Indexer {
     /// whatever it is called.
     pub markers: &'static [&'static str],
 
-    /// Source extensions this indexer covers, used only as a last resort when
-    /// no marker anywhere matched.
+    /// Markers that only count when this indexer's own source files sit beside
+    /// them.
+    ///
+    /// `.python-version` is a *tooling* file: pyenv pins an interpreter for a
+    /// repository whose Python is eight helper scripts in `scripts/`, which is
+    /// not a Python project. Requiring a `.py` in the same directory keeps a
+    /// pyenv-managed script collection detected while a Kotlin monorepo stops
+    /// being offered a Python index it has no use for.
+    pub weak_markers: &'static [&'static str],
+
+    /// Source extensions this indexer covers. Corroborates [`Self::weak_markers`],
+    /// and is a last resort when no marker anywhere matched.
     pub extensions: &'static [&'static str],
 
     /// Arguments that produce an index in the current directory.
@@ -39,6 +53,18 @@ pub struct Indexer {
     /// Arguments that depend on the project — `scip-python` requires a project
     /// name, and there is nowhere static to put one.
     pub dynamic_args: Option<fn(&Path) -> Vec<String>>,
+
+    /// How to index a module in a subdirectory *from the repository root*,
+    /// given that directory relative to the root.
+    ///
+    /// `None` means Arbor will not drive this indexer for a submodule. That is a
+    /// deliberate refusal rather than an oversight: an indexer run inside the
+    /// subdirectory emits paths relative to *it*, and ingesting those against
+    /// the repository root produces a graph full of files that do not exist —
+    /// which breaks `arbor diff`, `file-graph`, and every "now read this file"
+    /// follow-up, silently. Only set this where the root-relative behaviour has
+    /// been verified against a real index.
+    pub subproject_args: Option<fn(&Path) -> Vec<String>>,
 
     /// Printed when the binary is missing. Not a link: a user who has just been
     /// told they cannot index wants the command, not a browser tab.
@@ -63,9 +89,11 @@ pub const INDEXERS: &[Indexer] = &[
         binary: "scip-java",
         language: "Java/Kotlin",
         markers: &["build.gradle", "build.gradle.kts", "pom.xml"],
+        weak_markers: &[],
         extensions: &["java", "kt", "kts"],
         args: &["index"],
         dynamic_args: None,
+        subproject_args: None,
         install: "coursier bootstrap --standalone -o scip-java \
 org.scip-code:scip-java:0.13.1 --main org.scip_code.scip_java.ScipJava",
         retry: Some(crate::scip_pipeline::gradle_config_cache_retry),
@@ -74,9 +102,11 @@ org.scip-code:scip-java:0.13.1 --main org.scip_code.scip_java.ScipJava",
         binary: "rust-analyzer",
         language: "Rust",
         markers: &["Cargo.toml"],
+        weak_markers: &[],
         extensions: &["rs"],
         args: &["scip", "."],
         dynamic_args: None,
+        subproject_args: None,
         install: "rustup component add rust-analyzer",
         retry: None,
     },
@@ -84,9 +114,15 @@ org.scip-code:scip-java:0.13.1 --main org.scip_code.scip_java.ScipJava",
         binary: "scip-typescript",
         language: "TypeScript/JavaScript",
         markers: &["tsconfig.json"],
+        weak_markers: &[],
         extensions: &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"],
         args: &["index"],
         dynamic_args: None,
+        // `scip-typescript index ui` run from the repository root emits paths
+        // prefixed `ui/`, which is what makes a monorepo's front end compose
+        // with its backend in one graph. Verified on a 216-document Next.js
+        // module inside a Gradle repository.
+        subproject_args: Some(typescript_subproject),
         install: "npm install -g @sourcegraph/scip-typescript",
         retry: None,
     },
@@ -100,13 +136,17 @@ org.scip-code:scip-java:0.13.1 --main org.scip_code.scip_java.ScipJava",
             "requirements.txt",
             "Pipfile",
             "poetry.lock",
-            ".python-version",
         ],
+        weak_markers: &[".python-version"],
         extensions: &["py", "pyi"],
         args: &["index", "."],
         // Required by scip-python, with no default. The directory name is the
         // same thing a human would type.
         dynamic_args: Some(project_name_flag),
+        // `scip-python index scripts --project-name scripts` from the repository
+        // root emits paths prefixed `scripts/`. Verified against a real module
+        // inside a Gradle repository.
+        subproject_args: Some(python_subproject),
         install: "npm install -g @sourcegraph/scip-python",
         retry: None,
     },
@@ -114,9 +154,11 @@ org.scip-code:scip-java:0.13.1 --main org.scip_code.scip_java.ScipJava",
         binary: "scip-go",
         language: "Go",
         markers: &["go.mod"],
+        weak_markers: &[],
         extensions: &["go"],
         args: &[],
         dynamic_args: None,
+        subproject_args: None,
         install: "go install github.com/scip-code/scip-go/cmd/scip-go@latest",
         retry: None,
     },
@@ -124,9 +166,11 @@ org.scip-code:scip-java:0.13.1 --main org.scip_code.scip_java.ScipJava",
         binary: "scip-dotnet",
         language: "C#",
         markers: &["*.sln", "*.csproj"],
+        weak_markers: &[],
         extensions: &["cs"],
         args: &["index"],
         dynamic_args: None,
+        subproject_args: None,
         install: "dotnet tool install --global scip-dotnet",
         retry: None,
     },
@@ -137,9 +181,11 @@ org.scip-code:scip-java:0.13.1 --main org.scip_code.scip_java.ScipJava",
         // scip-clang cannot run without one, so matching on the build script
         // would promise an index Arbor cannot deliver.
         markers: &["compile_commands.json"],
+        weak_markers: &[],
         extensions: &[],
         args: &["--compdb-path=compile_commands.json"],
         dynamic_args: None,
+        subproject_args: None,
         install: "download a release from https://github.com/sourcegraph/scip-clang/releases",
         retry: None,
     },
@@ -147,9 +193,11 @@ org.scip-code:scip-java:0.13.1 --main org.scip_code.scip_java.ScipJava",
         binary: "scip-ruby",
         language: "Ruby",
         markers: &["Gemfile"],
+        weak_markers: &[],
         extensions: &["rb"],
         args: &["."],
         dynamic_args: None,
+        subproject_args: None,
         install: "add gem 'scip-ruby' to your Gemfile's development group",
         retry: None,
     },
@@ -157,9 +205,11 @@ org.scip-code:scip-java:0.13.1 --main org.scip_code.scip_java.ScipJava",
         binary: "scip-php",
         language: "PHP",
         markers: &["composer.json"],
+        weak_markers: &[],
         extensions: &["php"],
         args: &[],
         dynamic_args: None,
+        subproject_args: None,
         install: "composer require --dev davidrjenni/scip-php",
         retry: None,
     },
@@ -167,13 +217,35 @@ org.scip-code:scip-java:0.13.1 --main org.scip_code.scip_java.ScipJava",
         binary: "scip-dart",
         language: "Dart",
         markers: &["pubspec.yaml"],
+        weak_markers: &[],
         extensions: &["dart"],
         args: &["."],
         dynamic_args: None,
+        subproject_args: None,
         install: "dart pub global activate scip_dart",
         retry: None,
     },
 ];
+
+/// `scip-typescript index <dir>`, run from the repository root.
+fn typescript_subproject(module: &Path) -> Vec<String> {
+    vec!["index".to_string(), module.to_string_lossy().to_string()]
+}
+
+/// `scip-python index <dir> --project-name <dir>`, run from the repository root.
+fn python_subproject(module: &Path) -> Vec<String> {
+    let name = module
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "module".to_string());
+
+    vec![
+        "index".to_string(),
+        module.to_string_lossy().to_string(),
+        "--project-name".to_string(),
+        name,
+    ]
+}
 
 /// `--project-name <dir>`, which `scip-python` requires and has no default for.
 fn project_name_flag(project_root: &Path) -> Vec<String> {
@@ -184,6 +256,56 @@ fn project_name_flag(project_root: &Path) -> Vec<String> {
         .unwrap_or_else(|| "project".to_string());
 
     vec!["--project-name".to_string(), name]
+}
+
+impl PartialEq for Indexer {
+    fn eq(&self, other: &Self) -> bool {
+        self.binary == other.binary
+    }
+}
+
+impl Eq for Indexer {}
+
+/// An indexer paired with the module it was detected for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Detected {
+    pub indexer: &'static Indexer,
+
+    /// `None` for the repository root, otherwise the module directory relative
+    /// to it — `ui` for a Next.js front end inside a Gradle repository.
+    pub module: Option<PathBuf>,
+}
+
+impl Detected {
+    /// What to print for this module: `scip-typescript (TypeScript/JavaScript)`,
+    /// or `scip-typescript (TypeScript/JavaScript in ui/)`.
+    pub fn label(&self) -> String {
+        match &self.module {
+            None => format!("{} ({})", self.indexer.binary, self.indexer.language),
+            Some(dir) => format!(
+                "{} ({} in {}/)",
+                self.indexer.binary,
+                self.indexer.language,
+                dir.display()
+            ),
+        }
+    }
+
+    /// Whether Arbor can actually drive this one.
+    ///
+    /// A submodule needs an indexer that emits root-relative paths when given a
+    /// directory; without that the graph would name files that do not exist.
+    pub fn is_runnable(&self) -> bool {
+        self.module.is_none() || self.indexer.subproject_args.is_some()
+    }
+
+    /// The argument list for this module.
+    pub fn arguments(&self, project_root: &Path) -> Option<Vec<String>> {
+        match &self.module {
+            None => Some(self.indexer.arguments(project_root)),
+            Some(dir) => self.indexer.subproject_args.map(|build| build(dir)),
+        }
+    }
 }
 
 impl Indexer {
@@ -198,9 +320,26 @@ impl Indexer {
 
     /// Whether this project looks like one this indexer handles.
     pub fn applies_to(&self, project_root: &Path) -> bool {
-        self.markers
+        if self
+            .markers
             .iter()
             .any(|marker| marker_present(project_root, marker))
+        {
+            return true;
+        }
+
+        self.weak_markers
+            .iter()
+            .any(|marker| marker_present(project_root, marker))
+            && self.has_source_here(project_root)
+    }
+
+    /// Whether any of this indexer's source files sit directly in `directory`.
+    fn has_source_here(&self, directory: &Path) -> bool {
+        let present = root_extensions(directory);
+        self.extensions
+            .iter()
+            .any(|ext| present.iter().any(|found| found == ext))
     }
 }
 
@@ -225,22 +364,49 @@ fn marker_present(project_root: &Path, marker: &str) -> bool {
     project_root.join(marker).exists()
 }
 
-/// Every indexer whose markers are present, whether or not it is installed.
+/// Every module Arbor should index, whether or not its indexer is installed.
 ///
-/// Falls back to the source files at the root when no marker matches at all.
-/// Plenty of real projects are a directory of scripts with no manifest — a
-/// pyenv-managed Python repo with only `.py` files is the common case — and
-/// refusing those would be pedantry rather than caution. The fallback runs
-/// *only* when nothing else matched, so it can never add a spurious indexer
-/// alongside a correctly detected one.
-pub fn detect(project_root: &Path) -> Vec<&'static Indexer> {
-    let by_marker: Vec<&'static Indexer> = INDEXERS
+/// Three layers, in order, and only the first that produces anything is used:
+///
+///   1. markers at the repository root
+///   2. markers in *immediate* subdirectories — a monorepo's `ui/tsconfig.json`
+///      beside a root `build.gradle.kts` is the common shape, and root-only
+///      detection made that front end invisible
+///   3. the source extensions of the files at the root, for a project with no
+///      manifest at all
+///
+/// Depth one, deliberately. Recursing would find every vendored fixture, sample
+/// app and generated bundle in the tree and offer to start an indexer for each.
+pub fn detect(project_root: &Path) -> Vec<Detected> {
+    let mut found: Vec<Detected> = INDEXERS
         .iter()
         .filter(|indexer| indexer.applies_to(project_root))
+        .map(|indexer| Detected {
+            indexer,
+            module: None,
+        })
         .collect();
 
-    if !by_marker.is_empty() {
-        return by_marker;
+    for module in module_directories(project_root) {
+        for indexer in INDEXERS {
+            // An indexer already detected at the root covers its own modules:
+            // Gradle and Maven resolve a multi-module build themselves, and
+            // running a second pass over one subdirectory would duplicate work
+            // and fight the first for the build lock.
+            if found.iter().any(|d| std::ptr::eq(d.indexer, indexer)) {
+                continue;
+            }
+            if indexer.applies_to(&project_root.join(&module)) {
+                found.push(Detected {
+                    indexer,
+                    module: Some(module.clone()),
+                });
+            }
+        }
+    }
+
+    if !found.is_empty() {
+        return found;
     }
 
     let extensions = root_extensions(project_root);
@@ -252,7 +418,54 @@ pub fn detect(project_root: &Path) -> Vec<&'static Indexer> {
                 .iter()
                 .any(|ext| extensions.iter().any(|found| found == ext))
         })
+        .map(|indexer| Detected {
+            indexer,
+            module: None,
+        })
         .collect()
+}
+
+/// Immediate subdirectories that could hold a module, sorted for determinism.
+///
+/// Skips the directories that hold *other people's* code or build output. A
+/// `tsconfig.json` under `node_modules` describes a dependency, and indexing it
+/// would take minutes to produce a graph of somebody else's library.
+fn module_directories(project_root: &Path) -> Vec<PathBuf> {
+    const SKIP: &[&str] = &[
+        "node_modules",
+        "build",
+        "target",
+        "dist",
+        "out",
+        "vendor",
+        "venv",
+        "__pycache__",
+        "bin",
+        "obj",
+        "coverage",
+        "fixtures",
+        "testdata",
+        "examples",
+    ];
+
+    let Ok(entries) = std::fs::read_dir(project_root) else {
+        return Vec::new();
+    };
+
+    let mut directories: Vec<PathBuf> = entries
+        .flatten()
+        .filter(|entry| entry.path().is_dir())
+        .map(|entry| entry.file_name())
+        .filter(|name| {
+            let name = name.to_string_lossy();
+            // Hidden directories are tooling, not modules.
+            !name.starts_with('.') && !SKIP.contains(&name.as_ref())
+        })
+        .map(PathBuf::from)
+        .collect();
+
+    directories.sort();
+    directories
 }
 
 /// Extensions of the files directly inside the project root.
@@ -312,11 +525,12 @@ pub fn on_path(binary: &str) -> bool {
     })
 }
 
-/// A one-line summary for messages: `scip-java (Java/Kotlin)`.
-pub fn describe(indexers: &[&'static Indexer]) -> String {
-    indexers
+/// A one-line summary for messages: `scip-java (Java/Kotlin), scip-typescript
+/// (TypeScript/JavaScript in ui/)`.
+pub fn describe(detected: &[Detected]) -> String {
+    detected
         .iter()
-        .map(|i| format!("{} ({})", i.binary, i.language))
+        .map(Detected::label)
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -340,7 +554,7 @@ mod tests {
         let dir = project(&["build.gradle.kts"]);
         let found = detect(dir.path());
         assert_eq!(found.len(), 1);
-        assert_eq!(found[0].binary, "scip-java");
+        assert_eq!(found[0].indexer.binary, "scip-java");
     }
 
     #[test]
@@ -353,24 +567,119 @@ mod tests {
     fn detects_every_indexer_a_polyglot_repo_needs() {
         // Argus's shape: a Gradle backend with a TypeScript front end.
         let dir = project(&["build.gradle.kts", "tsconfig.json"]);
-        let found: Vec<&str> = detect(dir.path()).iter().map(|i| i.binary).collect();
+        let found: Vec<&str> = detect(dir.path())
+            .iter()
+            .map(|d| d.indexer.binary)
+            .collect();
         assert_eq!(found, vec!["scip-java", "scip-typescript"]);
     }
 
     #[test]
     fn extension_markers_match_any_filename() {
         let dir = project(&["Whatever.sln"]);
-        let found: Vec<&str> = detect(dir.path()).iter().map(|i| i.binary).collect();
+        let found: Vec<&str> = detect(dir.path())
+            .iter()
+            .map(|d| d.indexer.binary)
+            .collect();
         assert_eq!(found, vec!["scip-dotnet"]);
     }
 
+    /// Argus's shape: a Gradle backend at the root, a Next.js front end in ui/.
+    /// Root-only detection made those 213 TypeScript files invisible.
     #[test]
-    fn markers_are_root_only() {
-        // A tsconfig.json in a subdirectory is somebody else's build.
-        let dir = TempDir::new().unwrap();
-        fs::create_dir(dir.path().join("web")).unwrap();
-        fs::write(dir.path().join("web").join("tsconfig.json"), "").unwrap();
-        assert!(detect(dir.path()).is_empty());
+    fn a_module_in_a_subdirectory_is_detected() {
+        let dir = project(&["build.gradle.kts"]);
+        fs::create_dir(dir.path().join("ui")).unwrap();
+        fs::write(dir.path().join("ui").join("tsconfig.json"), "").unwrap();
+
+        let found = detect(dir.path());
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].indexer.binary, "scip-java");
+        assert_eq!(found[0].module, None);
+        assert_eq!(found[1].indexer.binary, "scip-typescript");
+        assert_eq!(found[1].module.as_deref(), Some(Path::new("ui")));
+        assert_eq!(
+            found[1].label(),
+            "scip-typescript (TypeScript/JavaScript in ui/)"
+        );
+    }
+
+    #[test]
+    fn a_dependency_directory_is_not_a_module() {
+        // A tsconfig.json under node_modules describes somebody else's library.
+        let dir = project(&["build.gradle.kts"]);
+        for skipped in ["node_modules", "build", "dist", ".venv", "examples"] {
+            fs::create_dir(dir.path().join(skipped)).unwrap();
+            fs::write(dir.path().join(skipped).join("tsconfig.json"), "").unwrap();
+        }
+
+        let found = detect(dir.path());
+        assert_eq!(found.len(), 1, "only the root Gradle build should be found");
+        assert_eq!(found[0].indexer.binary, "scip-java");
+    }
+
+    #[test]
+    fn a_build_tool_detected_at_the_root_owns_its_own_submodules() {
+        // Gradle resolves a multi-module build itself; a second pass over one
+        // module would duplicate work and fight the first for the build lock.
+        let dir = project(&["build.gradle.kts"]);
+        fs::create_dir(dir.path().join("service")).unwrap();
+        fs::write(dir.path().join("service").join("build.gradle.kts"), "").unwrap();
+
+        let found = detect(dir.path());
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].module, None);
+    }
+
+    #[test]
+    fn a_python_subproject_carries_its_project_name() {
+        let dir = project(&["build.gradle.kts"]);
+        fs::create_dir(dir.path().join("scripts")).unwrap();
+        fs::write(dir.path().join("scripts").join("requirements.txt"), "").unwrap();
+
+        let python = detect(dir.path())
+            .into_iter()
+            .find(|d| d.indexer.binary == "scip-python")
+            .unwrap();
+
+        assert_eq!(
+            python.arguments(dir.path()).unwrap(),
+            vec!["index", "scripts", "--project-name", "scripts"]
+        );
+    }
+
+    #[test]
+    fn only_subdirectories_arbor_can_index_correctly_are_runnable() {
+        // scip-go run inside a subdirectory emits paths relative to it, which
+        // would name files that do not exist at the repository root. Detected,
+        // reported, not run.
+        let dir = project(&["build.gradle.kts"]);
+        fs::create_dir(dir.path().join("agent")).unwrap();
+        fs::write(dir.path().join("agent").join("go.mod"), "").unwrap();
+
+        let found = detect(dir.path());
+        let go = found
+            .iter()
+            .find(|d| d.indexer.binary == "scip-go")
+            .expect("go module detected");
+        assert!(!go.is_runnable());
+        assert!(go.arguments(dir.path()).is_none());
+    }
+
+    #[test]
+    fn a_subproject_is_indexed_from_the_repository_root() {
+        let dir = project(&["build.gradle.kts"]);
+        fs::create_dir(dir.path().join("ui")).unwrap();
+        fs::write(dir.path().join("ui").join("tsconfig.json"), "").unwrap();
+
+        let ts = detect(dir.path())
+            .into_iter()
+            .find(|d| d.indexer.binary == "scip-typescript")
+            .unwrap();
+
+        // `scip-typescript index ui`, not `cd ui && scip-typescript index` —
+        // that is what makes the emitted paths root-relative.
+        assert_eq!(ts.arguments(dir.path()).unwrap(), vec!["index", "ui"]);
     }
 
     #[test]
@@ -379,7 +688,7 @@ mod tests {
         assert!(detect(cmake.path()).is_empty());
 
         let compdb = project(&["compile_commands.json"]);
-        assert_eq!(detect(compdb.path())[0].binary, "scip-clang");
+        assert_eq!(detect(compdb.path())[0].indexer.binary, "scip-clang");
     }
 
     #[test]
@@ -403,7 +712,10 @@ mod tests {
         // zep_config's shape: 80 .py files, no pyproject.toml, no requirements
         // — only pyenv's .python-version.
         let dir = project(&[".python-version", "billing.py", "retrieval.py"]);
-        let found: Vec<&str> = detect(dir.path()).iter().map(|i| i.binary).collect();
+        let found: Vec<&str> = detect(dir.path())
+            .iter()
+            .map(|d| d.indexer.binary)
+            .collect();
         assert_eq!(found, vec!["scip-python"]);
     }
 
@@ -411,7 +723,10 @@ mod tests {
     fn source_files_alone_are_enough_when_nothing_else_matches() {
         // A bare directory of scripts, not even a .python-version.
         let dir = project(&["one.py", "two.py", "notes.md"]);
-        let found: Vec<&str> = detect(dir.path()).iter().map(|i| i.binary).collect();
+        let found: Vec<&str> = detect(dir.path())
+            .iter()
+            .map(|d| d.indexer.binary)
+            .collect();
         assert_eq!(found, vec!["scip-python"]);
     }
 
@@ -420,7 +735,10 @@ mod tests {
         // A Rust project with a helper script at the root must not also try to
         // index Python: Cargo.toml already answered the question.
         let dir = project(&["Cargo.toml", "release.py"]);
-        let found: Vec<&str> = detect(dir.path()).iter().map(|i| i.binary).collect();
+        let found: Vec<&str> = detect(dir.path())
+            .iter()
+            .map(|d| d.indexer.binary)
+            .collect();
         assert_eq!(found, vec!["rust-analyzer"]);
     }
 
