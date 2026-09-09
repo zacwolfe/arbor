@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/arbor-core",
     "crates/arbor-graph",
+    "crates/arbor-scip",
     "crates/arbor-watcher",
     "crates/arbor-server",
     "crates/arbor-cli",

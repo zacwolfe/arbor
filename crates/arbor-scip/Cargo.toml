@@ -1,0 +1,30 @@
+[package]
+name = "arbor-scip"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme.workspace = true
+description = "SCIP index ingestion for Arbor — compiler-accurate graphs for JVM languages"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+arbor-core = { path = "../arbor-core", version = "3.0.0" }
+arbor-graph = { path = "../arbor-graph", version = "3.0.0" }
+
+# SCIP bindings from scip-code/scip (the format and these bindings originated
+# at Sourcegraph; 0.10.0 is published from scip-code). Ships pre-generated
+# protobuf code (`build = false`), so no `protoc` is needed at build time.
+scip = "0.10"
+# Pinned to match scip 0.10's own `=3.7.2`: the generated types implement that
+# exact version's `Message` trait, so a looser bound would not compile.
+protobuf = "=3.7.2"
+
+[dev-dependencies]
+tempfile = "3.0"
