@@ -3357,7 +3357,7 @@ pub fn refactor(
             println!("  • It's dynamically invoked (reflection, callbacks)");
             println!("  • It may be dead code");
             println!();
-            println!("{} Safe to change, but verify external usage.", "→".green());
+            print_absence_of_callers_verdict(&resolved_path);
         }
         (false, true) => {
             // Entry point (no callers, but calls others)
@@ -3377,10 +3377,12 @@ pub fn refactor(
             }
             println!();
             println!(
-                "{} Low risk upstream, {} downstream dependencies.",
-                "→".green(),
+                "{} No in-repo callers, so upstream risk is unmeasured rather than low. \
+{} downstream dependencies.",
+                "→".yellow(),
                 analysis.downstream.len().to_string().yellow()
             );
+            print_absence_of_callers_verdict(&resolved_path);
         }
         (true, false) => {
             // Leaf/utility node (has callers, but doesn't call anything)
@@ -4371,6 +4373,45 @@ pub fn audit(sink: &str, depth: usize, format: &str, path: &Path) -> Result<()> 
     );
 
     Ok(())
+}
+
+/// States what "no callers" is and is not evidence of.
+///
+/// This used to read "Safe to change, but verify external usage" — a safety
+/// claim derived from absence of evidence, and one that contradicted the
+/// "dynamically invoked" possibility printed three lines above it. A prompt
+/// template loaded by a library through an attribute lookup, a Spring bean wired
+/// by name, a Django view named in a URL conf: all have zero static callers and
+/// none are safe to change.
+///
+/// How much weight the absence carries depends on what built the graph, so the
+/// wording does too:
+///
+/// - a compiler-produced SCIP index resolved every call it could see, so "no
+///   in-repo callers" is close to a fact about this repository
+/// - Tree-sitter cannot type a receiver, so `obj.method()` may be a caller it
+///   never resolved — absence there is much weaker evidence
+fn print_absence_of_callers_verdict(project_root: &Path) {
+    println!(
+        "{} No in-repo callers found. That is not the same as safe to change.",
+        "→".yellow()
+    );
+
+    match arbor_graph::cache::is_scip_provenanced(project_root) {
+        true => println!(
+            "  {}",
+            "This graph came from a compiler index, so in-repo callers are \
+accounted for. External and dynamic callers are still invisible."
+                .dimmed()
+        ),
+        false => println!(
+            "  {}",
+            "This graph came from Tree-sitter, which cannot resolve calls on a \
+typed receiver — a caller may exist and simply not be in the graph. A compiler \
+index (arbor scip) answers this properly."
+                .dimmed()
+        ),
+    }
 }
 
 /// Resolves a symbol name to the node a user most likely meant.

@@ -707,6 +707,53 @@ fn a_dirty_index_without_scip_java_serves_the_cache_and_explains() {
     assert!(output.status.success(), "must still answer from the cache");
 }
 
+/// "No callers" must never be reported as safety. It used to read "Safe to
+/// change, but verify external usage", which is a safety claim derived from
+/// absence of evidence.
+#[test]
+fn an_isolated_node_is_not_declared_safe_to_change() {
+    let temp = setup_java_project();
+    let dir = temp.path();
+
+    run_arbor_stdout(dir, &["scip", "index.scip", "--root", "."]);
+
+    // The Gateway *type* is defined and never referenced, so it is isolated.
+    let stdout = run_arbor_stdout(dir, &["refactor", "Gateway", "."]);
+
+    assert!(
+        !stdout.contains("Safe to change"),
+        "absence of callers is not evidence of safety:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("not the same as safe to change"),
+        "should say what the absence does and does not mean:\n{stdout}"
+    );
+}
+
+/// How much "no callers" is worth depends on what built the graph, so the
+/// wording has to differ: a compiler index resolved every call it could see,
+/// Tree-sitter cannot resolve a call on a typed receiver at all.
+#[test]
+fn the_isolated_verdict_states_which_producer_it_trusts() {
+    let temp = setup_java_project();
+    let dir = temp.path();
+
+    run_arbor_stdout(dir, &["scip", "index.scip", "--root", "."]);
+    let from_scip = run_arbor_stdout(dir, &["refactor", "Gateway", "."]);
+    assert!(
+        from_scip.contains("came from a compiler index"),
+        "a SCIP graph should say in-repo callers are accounted for:\n{from_scip}"
+    );
+
+    // Downgrade the same project to Tree-sitter and ask again.
+    run_arbor_stdout(dir, &["index", ".", "--force"]);
+    let from_tree_sitter = run_arbor_stdout(dir, &["refactor", "Gateway", "."]);
+    assert!(
+        from_tree_sitter.contains("came from Tree-sitter"),
+        "a Tree-sitter graph should admit a caller may be unresolved:\n{from_tree_sitter}"
+    );
+}
+
 /// A read command that triggers a rebuild must not print the machine-readable
 /// stats block into the middle of its own output.
 #[test]
