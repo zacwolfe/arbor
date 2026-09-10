@@ -1456,6 +1456,45 @@ fn references_on_a_tree_sitter_graph_says_it_cannot_answer() {
     );
 }
 
+/// Guards the reason all four commands share one reporting function instead
+/// of four near-copies: a future fifth command that reuses the pattern but
+/// forgets to name the producer or the fix would still pass its own
+/// hand-written assertions if they only checked for *some* dimmed text. This
+/// drives every command from one table and fails loudly — naming which
+/// command and which phrase — if any one of them drifts.
+#[test]
+fn every_relationship_command_names_the_producer_and_the_fix_on_a_tree_sitter_graph() {
+    let temp = setup_java_project_with_relationships();
+    let dir = temp.path();
+
+    run_arbor_stdout(dir, &["index", "."]);
+
+    let commands: &[(&str, &[&str])] = &[
+        ("implementors", &["implementors", "Gateway", "."]),
+        ("supertypes", &["supertypes", "StripeGateway.charge", "."]),
+        ("uses-type", &["uses-type", "Gateway", "."]),
+        ("references", &["references", "Checkout.gateway", "."]),
+    ];
+
+    for (name, args) in commands {
+        let output = run_arbor(dir, args);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        assert!(
+            output.status.success(),
+            "{name}: a missing capability is not a user error: {stdout}"
+        );
+        assert!(
+            stdout.contains("Tree-sitter"),
+            "{name}: must name the producer that cannot answer this, got: {stdout}"
+        );
+        assert!(
+            stdout.contains("arbor scip"),
+            "{name}: must name the way to get a real answer, got: {stdout}"
+        );
+    }
+}
+
 #[test]
 fn supertypes_on_a_tree_sitter_graph_says_it_cannot_answer() {
     let temp = setup_java_project();

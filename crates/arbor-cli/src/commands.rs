@@ -4574,7 +4574,25 @@ pub fn implementors(symbol: &str, path: &Path, transitive: bool, json_output: bo
     }
 
     if found.is_empty() {
-        report_no_implementors(symbol, hierarchy_available, provenance);
+        RelationshipAbsence {
+            capability: "type hierarchy",
+            available: hierarchy_available,
+            provenance,
+            positive_absence_line: format!("Nothing implements or extends '{symbol}'."),
+            positive_absence_note: "This graph carries a type hierarchy, so in-repo \
+implementors are accounted for. External subclasses are still invisible."
+                .to_string(),
+            tree_sitter_reason: format!(
+                "It was built by Tree-sitter, which cannot resolve `class Middle(Base)` into \
+an edge, so '{symbol}' would look unimplemented either way. A compiler index carries the \
+hierarchy: arbor scip <index.scip>"
+            ),
+            scip_reason: format!(
+                "The indexer that produced it emits no implementation relationships — \
+rust-analyzer is one such. That is not evidence that '{symbol}' has no implementors."
+            ),
+        }
+        .report();
         return Ok(());
     }
 
@@ -4600,41 +4618,6 @@ pub fn implementors(symbol: &str, path: &Path, transitive: bool, json_output: bo
     Ok(())
 }
 
-/// Explains an empty implementor list without claiming there are none.
-///
-/// Three distinct situations, and collapsing them into "none found" is what makes
-/// a user delete an interface that four classes implement.
-fn report_no_implementors(symbol: &str, hierarchy_available: bool, provenance: &str) {
-    if hierarchy_available {
-        println!("Nothing implements or extends '{}'.", symbol);
-        println!(
-            "  {}",
-            "This graph carries a type hierarchy, so in-repo implementors are \
-accounted for. External subclasses are still invisible."
-                .dimmed()
-        );
-        return;
-    }
-
-    println!(
-        "{} This graph has no type hierarchy, so this question cannot be answered from it.",
-        "⚠".yellow()
-    );
-
-    let reason = match provenance {
-        "scip" => format!(
-            "The indexer that produced it emits no implementation relationships — \
-rust-analyzer is one such. That is not evidence that '{symbol}' has no implementors."
-        ),
-        _ => format!(
-            "It was built by Tree-sitter, which cannot resolve `class Middle(Base)` into \
-an edge, so '{symbol}' would look unimplemented either way. A compiler index carries the \
-hierarchy: arbor scip <index.scip>"
-        ),
-    };
-    println!("  {}", reason.dimmed());
-}
-
 /// `"scip"`/`"tree-sitter"`, from whether `.arbor/scip.json` is present.
 ///
 /// Shared by every relationship command's degradation reporting, so the two
@@ -4646,65 +4629,99 @@ fn provenance_str(project_root: &Path) -> &'static str {
     }
 }
 
-/// Explains an empty relationship list without claiming there is nothing to
-/// find.
+/// Explains an empty relationship result — `implementors`, `supertypes`,
+/// `uses-type`, `references` — without claiming there is nothing to find.
 ///
-/// Every edge kind a compiler index alone produces — inheritance, type usage,
-/// bare references — has the same two failure modes: genuinely nothing found
-/// (the kind exists elsewhere in this graph) and the graph cannot construct
-/// this kind at all (Tree-sitter, or a SCIP indexer that happens not to emit
-/// it). Collapsing those into one "none found" is the mistake
-/// [`report_no_implementors`] exists to avoid, and it applies word-for-word to
-/// every kind here — hence one shared function rather than three near-copies.
+/// Every edge kind a compiler index alone produces has the same two failure
+/// modes: genuinely nothing found (the kind exists elsewhere in this graph)
+/// and the graph cannot construct this kind at all (Tree-sitter, or a SCIP
+/// indexer that happens not to emit it). Collapsing those into one "none
+/// found" is how an interface with four implementations gets reported as
+/// having none, and it applies word-for-word to all four commands — hence one
+/// shared type rather than four near-copies.
 ///
-/// `positive_absence_line` is the fully-formed sentence for "the kind exists,
-/// but this particular symbol has none" — it differs by direction (asking who
-/// implements X reads differently from asking what X implements), so it is
-/// supplied rather than assembled here. `capability` is the bare noun phrase
-/// naming what the graph would need ("type hierarchy", "type usage data",
-/// "reference data"). `scip_specific_reason`, when given, replaces the generic
-/// "the indexer emits none of this" sentence with one naming which indexers are
-/// known to skip it.
-fn report_relationship_absence(
-    symbol: &str,
-    positive_absence_line: &str,
-    capability: &str,
+/// A struct rather than more positional parameters: `available`/`provenance`
+/// are shared verbatim by every call site, but each of the four sentences
+/// below is direction- and wording-specific (asking who implements
+/// X reads differently from asking what X implements; "a type hierarchy"
+/// needs an article that "type usage data" does not). Passing five-plus
+/// strings positionally is exactly the six-parameter problem this replaces;
+/// named fields make each call site self-documenting instead of a row of
+/// blanks matched up by counting. A trait or enum per command would be the
+/// same information behind more machinery for four call sites.
+struct RelationshipAbsence<'a> {
+    /// Bare noun phrase for the unanswerable header, `"This graph has no
+    /// {capability}"` — reads correctly unqualified for every capability used
+    /// here ("no type hierarchy", "no type usage data", "no reference data").
+    /// The article problem lives only in the *positive* branch below, which
+    /// is why that branch takes a whole sentence instead of this noun.
+    capability: &'a str,
+    /// Whether the graph carries this edge kind at all
+    /// (`has_inheritance_edges` / `has_edges_of_kind`) — distinct from
+    /// `found.is_empty()`, which only says *this* symbol has none.
     available: bool,
-    provenance: &str,
-    scip_specific_reason: Option<&str>,
-) {
-    if available {
-        println!("{}", positive_absence_line);
-        println!(
-            "  {}",
-            format!(
-                "This graph carries {capability}, so in-repo occurrences are \
-accounted for. External ones are still invisible."
-            )
-            .dimmed()
-        );
-        return;
-    }
+    /// `"scip"` or `"tree-sitter"`.
+    provenance: &'a str,
+    /// Fully-formed sentence for "the kind exists, but this symbol has
+    /// none".
+    positive_absence_line: String,
+    /// Fully-formed dimmed note that follows it. Supplied whole rather than
+    /// built from `capability`, because "carries {capability}" needs an
+    /// article for some nouns ("a type hierarchy") and not others ("type
+    /// usage data"), and each command counts a different noun anyway
+    /// (implementors vs. supertypes vs. occurrences).
+    positive_absence_note: String,
+    /// Fully-formed Tree-sitter sentence. `implementors`/`supertypes` name
+    /// the concrete construct Tree-sitter cannot resolve (`class
+    /// Middle(Base)`); `uses-type`/`references` have no single such
+    /// construct, so theirs stays generic.
+    tree_sitter_reason: String,
+    /// Fully-formed SCIP sentence for why an indexer might still emit none of
+    /// this kind. `implementors`/`supertypes` name `rust-analyzer`, the
+    /// concrete indexer known to skip it; the other two stay generic.
+    scip_reason: String,
+}
 
-    println!(
-        "{} This graph has no {capability}, so this question cannot be answered from it.",
-        "⚠".yellow()
-    );
-
-    let reason = match (provenance, scip_specific_reason) {
-        ("scip", Some(extra)) => {
-            format!("{extra} That is not evidence that '{symbol}' has none.")
+impl RelationshipAbsence<'_> {
+    fn report(&self) {
+        if self.available {
+            println!("{}", self.positive_absence_line);
+            println!("  {}", self.positive_absence_note.dimmed());
+            return;
         }
-        ("scip", None) => format!(
-            "The indexer that produced it emits no {capability}. That is not evidence \
-that '{symbol}' has none."
-        ),
-        _ => format!(
-            "It was built by Tree-sitter, which constructs no {capability} at all, so \
+
+        println!(
+            "{} This graph has no {}, so this question cannot be answered from it.",
+            "⚠".yellow(),
+            self.capability
+        );
+
+        let reason = match self.provenance {
+            "scip" => &self.scip_reason,
+            _ => &self.tree_sitter_reason,
+        };
+        println!("  {}", reason.dimmed());
+    }
+}
+
+/// The generic Tree-sitter reason shared by `uses-type` and `references`,
+/// which — unlike `implementors`/`supertypes` — have no single AST construct
+/// to name as the thing Tree-sitter cannot resolve.
+fn generic_tree_sitter_reason(capability: &str, symbol: &str) -> String {
+    format!(
+        "It was built by Tree-sitter, which constructs no {capability} at all, so \
 '{symbol}' would look the same either way. A compiler index carries it: arbor scip <index.scip>"
-        ),
-    };
-    println!("  {}", reason.dimmed());
+    )
+}
+
+/// The generic SCIP reason shared by `uses-type` and `references`, which —
+/// unlike `implementors`/`supertypes` — have no specific indexer on record as
+/// skipping this edge kind.
+fn generic_scip_reason(capability: &str, symbol: &str) -> String {
+    format!(
+        "The indexer that produced it emits no {capability}. That is not evidence \
+that '{symbol}' has none."
+    )
 }
 
 /// Filters by `--exclude-test`, then caps at `limit` (`0` = unlimited).
@@ -4837,14 +4854,18 @@ pub fn uses_type(
     }
 
     if found.is_empty() {
-        report_relationship_absence(
-            symbol,
-            &format!("Nothing is typed as '{}'.", symbol),
-            "type usage data",
+        RelationshipAbsence {
+            capability: "type usage data",
             available,
             provenance,
-            None,
-        );
+            positive_absence_line: format!("Nothing is typed as '{symbol}'."),
+            positive_absence_note: "This graph carries type usage data, so in-repo uses \
+are accounted for. External ones are still invisible."
+                .to_string(),
+            tree_sitter_reason: generic_tree_sitter_reason("type usage data", symbol),
+            scip_reason: generic_scip_reason("type usage data", symbol),
+        }
+        .report();
         return Ok(());
     }
 
@@ -4914,14 +4935,18 @@ pub fn references(
     }
 
     if found.is_empty() {
-        report_relationship_absence(
-            symbol,
-            &format!("Nothing references '{}'.", symbol),
-            "reference data",
+        RelationshipAbsence {
+            capability: "reference data",
             available,
             provenance,
-            None,
-        );
+            positive_absence_line: format!("Nothing references '{symbol}'."),
+            positive_absence_note: "This graph carries reference data, so in-repo \
+references are accounted for. External ones are still invisible."
+                .to_string(),
+            tree_sitter_reason: generic_tree_sitter_reason("reference data", symbol),
+            scip_reason: generic_scip_reason("reference data", symbol),
+        }
+        .report();
         return Ok(());
     }
 
@@ -5031,17 +5056,25 @@ pub fn supertypes(
     }
 
     if found.is_empty() {
-        report_relationship_absence(
-            symbol,
-            &format!("'{}' implements or extends nothing.", symbol),
-            "type hierarchy",
-            hierarchy_available,
+        RelationshipAbsence {
+            capability: "type hierarchy",
+            available: hierarchy_available,
             provenance,
-            Some(
-                "Some indexers emit no implementation relationships — rust-analyzer is \
-one such.",
+            positive_absence_line: format!("'{symbol}' implements or extends nothing."),
+            positive_absence_note: "This graph carries a type hierarchy, so in-repo \
+supertypes are accounted for. External ones are still invisible."
+                .to_string(),
+            tree_sitter_reason: format!(
+                "It was built by Tree-sitter, which cannot resolve `class Middle(Base)` into \
+an edge, so '{symbol}' would look like it extends nothing either way. A compiler index \
+carries the hierarchy: arbor scip <index.scip>"
             ),
-        );
+            scip_reason: format!(
+                "Some indexers emit no implementation relationships — rust-analyzer is \
+one such. That is not evidence that '{symbol}' has none."
+            ),
+        }
+        .report();
         return Ok(());
     }
 

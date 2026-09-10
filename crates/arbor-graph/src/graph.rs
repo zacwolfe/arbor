@@ -308,20 +308,21 @@ impl ArborGraph {
     }
 
     /// Gets nodes that call the given node.
+    ///
+    /// Deduplicated by node — one entry per distinct caller, however many call
+    /// sites it has. This used to walk `neighbors_directed` and re-look-up each
+    /// pair with `find_edge`, which is wrong twice over on a `StableDiGraph`
+    /// that allows parallel edges: `neighbors_directed` yields a neighbour once
+    /// *per edge*, so a caller with three call sites was returned three times
+    /// (measured on a real `scip-java` graph: 20,139 `Calls` edges collapse to
+    /// 17,156 distinct pairs — 14.8% of every listing was a repeat), and
+    /// `find_edge` returns only one edge for a pair, so a pair carrying both a
+    /// `Calls` and e.g. an `Implements` edge either doubled up or lost the call
+    /// entirely depending on which edge `find_edge` happened to hand back (32
+    /// such pairs on that same graph). Now built on [`Self::related`], which
+    /// sees every parallel edge via `edges_directed` and dedupes by `NodeId`.
     pub fn get_callers(&self, index: NodeId) -> Vec<&CodeNode> {
-        self.graph
-            .neighbors_directed(index, petgraph::Direction::Incoming)
-            .filter_map(|idx| {
-                // Check if the edge is a call
-                let edge_idx = self.graph.find_edge(idx, index)?;
-                let edge = self.graph.edge_weight(edge_idx)?;
-                if edge.kind == EdgeKind::Calls {
-                    self.graph.node_weight(idx)
-                } else {
-                    None
-                }
-            })
-            .collect()
+        self.related(index, &[EdgeKind::Calls], Direction::Incoming)
     }
 
     /// Types that implement or extend this one, directly.
@@ -499,19 +500,14 @@ impl ArborGraph {
     }
 
     /// Gets nodes that this node calls.
+    ///
+    /// Same fix, same reasoning, as [`Self::get_callers`]: deduplicated by
+    /// node via [`Self::related`] rather than walking `neighbors_directed` and
+    /// re-resolving each pair with `find_edge`, which duplicated a callee with
+    /// multiple call sites and could lose a call entirely when the same pair
+    /// also carried a non-`Calls` edge.
     pub fn get_callees(&self, index: NodeId) -> Vec<&CodeNode> {
-        self.graph
-            .neighbors_directed(index, petgraph::Direction::Outgoing)
-            .filter_map(|idx| {
-                let edge_idx = self.graph.find_edge(index, idx)?;
-                let edge = self.graph.edge_weight(edge_idx)?;
-                if edge.kind == EdgeKind::Calls {
-                    self.graph.node_weight(idx)
-                } else {
-                    None
-                }
-            })
-            .collect()
+        self.related(index, &[EdgeKind::Calls], Direction::Outgoing)
     }
 
     /// Gets all nodes that depend on the given node (directly or transitively).
@@ -886,6 +882,54 @@ mod tests {
         // No callers/callees for disconnected nodes
         assert!(g.get_callers(a).is_empty());
         assert!(g.get_callees(b).is_empty());
+    }
+
+    #[test]
+    fn parallel_calls_edges_yield_the_caller_and_callee_once() {
+        // Two call sites from the same caller to the same callee — the
+        // `StableDiGraph` allows the parallel edge, and `get_callers`/
+        // `get_callees` must not report the pair twice just because it has
+        // two edges.
+        let mut g = ArborGraph::new();
+        let a = g.add_node(make_node("caller", "a.rs"));
+        let b = g.add_node(make_node("callee", "b.rs"));
+        g.add_edge(a, b, Edge::new(EdgeKind::Calls));
+        g.add_edge(a, b, Edge::new(EdgeKind::Calls));
+
+        let callers = g.get_callers(b);
+        assert_eq!(callers.len(), 1, "two parallel Calls edges, one caller");
+        assert_eq!(callers[0].name, "caller");
+
+        let callees = g.get_callees(a);
+        assert_eq!(callees.len(), 1, "two parallel Calls edges, one callee");
+        assert_eq!(callees[0].name, "callee");
+    }
+
+    #[test]
+    fn a_pair_with_both_calls_and_implements_loses_neither() {
+        // The 32-pair case from the real graph: a `Calls` edge and an
+        // `Implements` edge between the same two nodes. The old
+        // `find_edge`-based lookup returned only one of them per pair, so
+        // this either duplicated the call or silently dropped it depending on
+        // which edge `find_edge` happened to hand back. `get_callers` and
+        // `implementors` must each see their own edge, independent of the other.
+        let mut g = ArborGraph::new();
+        let base = g.add_node(make_node("Base", "base.rs"));
+        let derived = g.add_node(make_node("Derived", "derived.rs"));
+        g.add_edge(derived, base, Edge::new(EdgeKind::Calls));
+        g.add_edge(derived, base, Edge::new(EdgeKind::Implements));
+
+        let callers = g.get_callers(base);
+        assert_eq!(callers.len(), 1, "the Calls edge must not be hidden");
+        assert_eq!(callers[0].name, "Derived");
+
+        let implementors = g.implementors(base);
+        assert_eq!(
+            implementors.len(),
+            1,
+            "the Implements edge must not be hidden"
+        );
+        assert_eq!(implementors[0].name, "Derived");
     }
 
     #[test]
