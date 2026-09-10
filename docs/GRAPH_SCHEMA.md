@@ -8,25 +8,29 @@ Every code entity is represented as a node in the graph.
 
 ### Node Structure
 
+This is `arbor_core::CodeNode` as actually serialized — flat, `snake_case`,
+no nested `attributes` object and no `centrality` field (centrality is
+computed on the graph, not stored per node in the export):
+
 ```json
 {
   "id": "unique_node_identifier",
-  "name": "FunctionName",
-  "qualifiedName": "ModuleName.ClassName.FunctionName",
-  "kind": "function",
+  "name": "validateUser",
+  "qualified_name": "UserService.validateUser",
+  "kind": "method",
   "file": "src/services/user.ts",
-  "lineStart": 45,
-  "lineEnd": 78,
+  "line_start": 45,
+  "line_end": 78,
   "column": 2,
   "signature": "async validateUser(id: string): Promise<User>",
   "visibility": "public",
-  "attributes": {
-    "async": true,
-    "static": false,
-    "exported": true
-  },
+  "is_async": true,
+  "is_static": false,
+  "is_exported": true,
   "docstring": "Validates a user by their ID.",
-  "centrality": 0.75
+  "byte_start": 1024,
+  "byte_end": 1842,
+  "references": ["db.findUser", "logger.info"]
 }
 ```
 
@@ -67,18 +71,24 @@ Edges represent relationships between nodes.
 
 ### Edge Structure
 
+This is `ExportEdge` (`crates/arbor-graph/src/edge.rs`), flat, no nested
+`location`:
+
 ```json
 {
-  "from": "source_node_id",
-  "to": "target_node_id",
+  "source": "source_node_id",
+  "target": "target_node_id",
   "kind": "calls",
-  "location": {
-    "file": "src/services/user.ts",
-    "line": 52,
-    "column": 8
-  }
+  "confidence": 1.0,
+  "file": "src/services/user.ts",
+  "line": 52
 }
 ```
+
+`confidence` is `1.0` for an exact match (a SCIP-provenanced edge, or a
+Tree-sitter edge resolved by full qualified name) and lower for a name-only
+guess. `file`/`line` are `null` when the edge carries no location (for
+example, a synthesised virtual-dispatch edge).
 
 ### Edge Kinds
 
