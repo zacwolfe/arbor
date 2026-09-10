@@ -2013,7 +2013,10 @@ fn print_scip_summary(
         covered_files.len().to_string().cyan()
     );
     println!(
-        "  {} references resolved, {} external (JDK, jars, packages), {} unattributed",
+        // "outside this index" rather than "JDK, jars, packages": that label was
+        // written for scip-java and read as a mistake on a Go project, where the
+        // same bucket is the standard library and module dependencies.
+        "  {} references resolved, {} external (stdlib, dependencies), {} unattributed",
         stats.references_resolved.to_string().cyan(),
         stats.references_external.to_string().dimmed(),
         stats.references_unattributed.to_string().dimmed()
@@ -5668,7 +5671,7 @@ pub fn map(
                 let sig_short = node
                     .signature
                     .as_deref()
-                    .map(map_shorten_signature)
+                    .map(|s| map_shorten_signature(&node.name, s, &node.file))
                     .unwrap_or_else(|| node.name.clone());
 
                 let item_cost = sig_short.len() + 50;
@@ -5765,7 +5768,7 @@ pub fn map(
                         let sig_short = node
                             .signature
                             .as_deref()
-                            .map(map_shorten_signature)
+                            .map(|s| map_shorten_signature(&node.name, s, &node.file))
                             .unwrap_or_else(|| node.name.clone());
                         format!("    {}  {}{}", sig_short, line_info, entry_marker)
                     };
@@ -5976,35 +5979,122 @@ fn map_compress_path(file_path: &str, root: &str) -> String {
     format!("{}/.../{}/{}/{}", first, grandparent, parent, filename)
 }
 
-fn map_shorten_signature(sig: &str) -> String {
+/// Which end of a parameter chunk holds the name, since that convention is
+/// language-dependent and cannot be guessed from the text alone. A `&str`
+/// match on the file extension would read the same; this enum is spelled
+/// out because the three arms have distinct rules (Rust also keys off `:`)
+/// and a name is easier to audit at the call site than a raw extension string.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ParamNameStyle {
+    /// `command string` -> `command` (Go: name comes first).
+    Go,
+    /// `graph: &ArborGraph` -> `graph` (also matches TS's `name: Type`, handled
+    /// separately below since it doesn't need the file extension at all).
+    Rust,
+    /// `String command` -> `command` (Java/TS/C#/C++: name is the last word).
+    Other,
+}
+
+impl ParamNameStyle {
+    fn for_file(file: &str) -> Self {
+        match std::path::Path::new(file)
+            .extension()
+            .and_then(|e| e.to_str())
+        {
+            Some("go") => ParamNameStyle::Go,
+            Some("rs") => ParamNameStyle::Rust,
+            _ => ParamNameStyle::Other,
+        }
+    }
+}
+
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// Finds `name` in `sig` as a whole word (not a substring of a longer
+/// identifier or keyword — e.g. a Go function named `f` must not match the
+/// `f` inside `func`). Returns the byte offset of the first such match.
+fn map_find_name_boundary(sig: &str, name: &str) -> Option<usize> {
+    if name.is_empty() {
+        return None;
+    }
+    let mut search_from = 0;
+    while let Some(rel) = sig[search_from..].find(name) {
+        let start = search_from + rel;
+        let end = start + name.len();
+        let before_ok = sig[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !is_word_char(c));
+        let after_ok = sig[end..].chars().next().is_none_or(|c| !is_word_char(c));
+        if before_ok && after_ok {
+            return Some(start);
+        }
+        search_from = start + 1;
+        if search_from >= sig.len() {
+            break;
+        }
+    }
+    None
+}
+
+/// Renders a stored signature down to `name(params)`, using the node's own
+/// `name` rather than re-deriving it from the signature text, and locating
+/// the parameter list by finding the first balanced `(...)` group that
+/// starts after that name — not "the first `(` in the string" (that's a
+/// receiver in a Go method) and not "up to the last `)`" (that swallows a
+/// tuple return type). `file` picks the parameter-naming convention, which
+/// is not inferable from the signature text alone.
+fn map_shorten_signature(name: &str, sig: &str, file: &str) -> String {
     let sig = sig.trim();
 
-    let paren_start = match sig.find('(') {
-        Some(i) => i,
-        None => {
-            if sig.len() <= 80 {
-                return sig.to_string();
-            } else {
-                return format!("{}...", &sig[..77]);
-            }
+    let fallback = || {
+        if sig.len() <= 80 {
+            sig.to_string()
+        } else {
+            format!("{}...", &sig[..77])
         }
     };
 
-    // Extract name: last word before the opening paren
-    let before_paren = &sig[..paren_start];
-    let name = before_paren
-        .split_whitespace()
-        .last()
-        .unwrap_or(before_paren)
-        .trim();
+    let name_start = match map_find_name_boundary(sig, name) {
+        Some(i) => i,
+        None => return fallback(),
+    };
+    let after_name = name_start + name.len();
 
-    let paren_end = match sig.rfind(')') {
+    let paren_start = match sig[after_name..].find('(') {
+        Some(rel) => after_name + rel,
+        None => return fallback(),
+    };
+
+    // Match the opening paren to its balancing close by depth, so a return
+    // tuple's parens (which come after this group) are never mistaken for
+    // the parameter list.
+    let bytes = sig.as_bytes();
+    let mut depth: i32 = 0;
+    let mut paren_end = None;
+    for (i, &b) in bytes.iter().enumerate().skip(paren_start) {
+        match b {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    paren_end = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let paren_end = match paren_end {
         Some(i) => i,
         None => return format!("{}(...)", name),
     };
 
     let params_str = &sig[paren_start + 1..paren_end];
-    let param_names = map_extract_param_names(params_str);
+    let style = ParamNameStyle::for_file(file);
+    let param_names = map_extract_param_names(params_str, style);
 
     let result = if param_names.is_empty() {
         format!("{}()", name)
@@ -6019,7 +6109,7 @@ fn map_shorten_signature(sig: &str) -> String {
     }
 }
 
-fn map_extract_param_names(params_str: &str) -> Vec<&str> {
+fn map_extract_param_names(params_str: &str, style: ParamNameStyle) -> Vec<&str> {
     if params_str.trim().is_empty() {
         return Vec::new();
     }
@@ -6034,7 +6124,7 @@ fn map_extract_param_names(params_str: &str) -> Vec<&str> {
             b'<' | b'(' => depth += 1,
             b'>' | b')' => depth -= 1,
             b',' if depth == 0 => {
-                if let Some(name) = map_last_word_of_param(&params_str[start..i]) {
+                if let Some(name) = map_param_name(&params_str[start..i], style) {
                     names.push(name);
                 }
                 start = i + 1;
@@ -6042,26 +6132,108 @@ fn map_extract_param_names(params_str: &str) -> Vec<&str> {
             _ => {}
         }
     }
-    if let Some(name) = map_last_word_of_param(&params_str[start..]) {
+    if let Some(name) = map_param_name(&params_str[start..], style) {
         names.push(name);
     }
 
     names
 }
 
-fn map_last_word_of_param(param: &str) -> Option<&str> {
+fn map_param_name(param: &str, style: ParamNameStyle) -> Option<&str> {
     let trimmed = param.trim();
     if trimmed.is_empty() {
         return None;
     }
-    // Rust-style: name before the colon
+    // `name: Type` (Rust, and incidentally TS) - name is before the colon,
+    // regardless of which style was requested.
     if let Some(colon_pos) = trimmed.find(':') {
         let before_colon = trimmed[..colon_pos].trim();
         return before_colon.split_whitespace().last();
     }
-    // Java/TS-style: name is last word
-    trimmed.split_whitespace().last()
+    match style {
+        // Go: `command string` -> first word. Also covers grouped params
+        // (`a, b string` splits into chunks "a" and "b string" before this
+        // is called; the first word of each is "a" and "b") and type-only
+        // chunks (`string` -> first word is the whole token, so it still
+        // yields something instead of nothing).
+        ParamNameStyle::Go => trimmed.split_whitespace().next(),
+        // Rust without a colon (rare) and everything else: last word.
+        ParamNameStyle::Rust | ParamNameStyle::Other => trimmed.split_whitespace().last(),
+    }
 }
+
+#[cfg(test)]
+mod map_shorten_signature_tests {
+    use super::map_shorten_signature;
+
+    #[test]
+    fn go_method_with_receiver_and_named_return_tuple() {
+        let sig = "func (t *ShellTool) analyzeBashCommand(command string, cwd string) (isBlocked bool, blockReason error, needsConfirmation bool)";
+        assert_eq!(
+            map_shorten_signature("analyzeBashCommand", sig, "x.go"),
+            "analyzeBashCommand(command, cwd)"
+        );
+    }
+
+    #[test]
+    fn go_free_function_with_tuple_return() {
+        let sig = "func LoadAllowedCommands(global bool) (map[string]map[string]bool, error)";
+        assert_eq!(
+            map_shorten_signature("LoadAllowedCommands", sig, "x.go"),
+            "LoadAllowedCommands(global)"
+        );
+    }
+
+    #[test]
+    fn go_grouped_params() {
+        let sig = "func f(a, b string) error";
+        assert_eq!(map_shorten_signature("f", sig, "x.go"), "f(a, b)");
+    }
+
+    #[test]
+    fn java_names_not_types_and_generics_do_not_split_params() {
+        let sig = "public void updateUnselectedOffers(OffersContext ctx, List<EligibilityOffer> unselectedOffers, boolean retainingFirstOffer)";
+        assert_eq!(
+            map_shorten_signature("updateUnselectedOffers", sig, "x.java"),
+            "updateUnselectedOffers(ctx, unselectedOffers, retainingFirstOffer)"
+        );
+    }
+
+    #[test]
+    fn rust_basic_params() {
+        let sig = "fn compute_centrality(graph: &ArborGraph, iterations: usize, damping: f64) -> CentralityScores";
+        assert_eq!(
+            map_shorten_signature("compute_centrality", sig, "x.rs"),
+            "compute_centrality(graph, iterations, damping)"
+        );
+    }
+
+    #[test]
+    fn rust_tuple_return_is_not_mistaken_for_params() {
+        let sig = "fn split(s: &str) -> (A, B)";
+        assert_eq!(map_shorten_signature("split", sig, "x.rs"), "split(s)");
+    }
+
+    #[test]
+    fn no_parameter_case() {
+        let sig = "fn tick() -> ()";
+        assert_eq!(map_shorten_signature("tick", sig, "x.rs"), "tick()");
+    }
+
+    #[test]
+    fn no_parens_at_all_falls_back_to_truncation() {
+        let sig = "String";
+        assert_eq!(map_shorten_signature("name", sig, "x.java"), "String");
+    }
+
+    #[test]
+    fn name_not_in_signature_falls_back_without_panicking() {
+        let sig = "some unrelated signature text with (parens, in, it)";
+        let result = map_shorten_signature("doesNotAppear", sig, "x.go");
+        assert_eq!(result, sig);
+    }
+}
+
 pub fn agent_onboard(path: &Path, json: bool) -> Result<()> {
     let resolved_path = resolve_project_path(path)?;
     let _ = ensure_arbor_initialized(&resolved_path)?;

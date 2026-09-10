@@ -36,10 +36,10 @@ how scopes are spelled (`.` versus `::`) and what an indexer calls a constructor
 | Java, Kotlin | [`scip-java`] | **verified** on a 406-document Spring service |
 | Rust | [`rust-analyzer`] | **verified** on Arbor itself — 69 documents, 2,109 nodes, 10,554 edges |
 | TypeScript, JavaScript | [`scip-typescript`] | **verified** on a Rust + TypeScript project, both languages in one graph |
-| Python | [`scip-python`] | ingests; bring your own index |
+| Python | [`scip-python`] | **verified** on an 80-document project — 1,678 nodes, 3,590 edges |
+| Go | [`scip-go`] | **verified** on an 86-document module — 1,097 nodes, 4,689 edges, 88 interface implementations |
 | C, C++ | [`scip-clang`] | ingests; bring your own index |
 | C# | [`scip-dotnet`] | ingests; bring your own index |
-| Go | [`scip-go`] | ingests; bring your own index |
 | Ruby | [`scip-ruby`] | ingests; bring your own index |
 | PHP | [`scip-php`] | ingests; bring your own index |
 | Dart | [`scip-dart`] | ingests; bring your own index |
@@ -210,11 +210,18 @@ scip-dotnet index
 
 ### Go — [`scip-go`]
 
+The org is `scip-code`, not `sourcegraph` — the old path 404s.
+
 ```bash
-go install github.com/scip-code/scip-go/cmd/scip-go@latest
+GOBIN=~/bin go install github.com/scip-code/scip-go/cmd/scip-go@v0.2.7
 scip-go                                  # add --module-name / --module-version if it asks
 arbor scip index.scip --root .
 ```
+
+Cheapest indexer of the set: 4.7s for an 86-file module, no build artifacts
+needed. It emits `is_implementation` relationships, so `arbor implementors` works
+on Go's structural interfaces — a compiler-only answer, since nothing in the
+source text says which structs satisfy an interface.
 
 ### Ruby — [`scip-ruby`]
 
@@ -429,7 +436,7 @@ Measured on a real 406-document Spring service (31 MB index):
 ```
 ✓ Ingested 406 documents from scip-java 0.0.0-SNAPSHOT (java)
   10576 definitions across 402 files
-  41526 references resolved, 170148 external (JDK, jars, packages), 2055 unattributed
+  41526 references resolved, 170148 external (stdlib, dependencies), 2055 unattributed
   26767 references ignored (locals, params, type params), 594 self/recursive, 0 unreadable
   837 implements/override edges, 3091 added by dispatch expansion
 ✓ Graph: 10576 nodes, 45420 edges (43397 confident)
@@ -446,8 +453,10 @@ remainder is indistinguishable from a decoding bug.
   17,617 are locals and 124 are type parameters — neither belongs in a call
   graph. What is left is 6,615 methods, 3,363 fields, and 601 types.
 - **external** — references to symbols that could have been nodes but have no
-  definition here: the JDK, third-party jars, and package names. Expected to
-  dominate; they are dropped rather than added as leaf vertices no query wants.
+  definition here: the standard library, third-party dependencies, and package
+  names — the JDK and jars above, `fmt` and Go modules on a Go project.
+  Expected to dominate; they are dropped rather than added as leaf vertices no
+  query wants.
 - **ignored** — references to locals, parameters, and type parameters. Counted
   separately from `external` on purpose: folding them together overstates how
   much the index is failing to cover.
