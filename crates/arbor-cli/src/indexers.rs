@@ -24,6 +24,22 @@ pub struct Indexer {
     /// Executable name, looked up on `PATH`.
     pub binary: &'static str,
 
+    /// Additional places this indexer may be found, tried after `binary`, in
+    /// order:
+    ///
+    /// 1. an entry starting with `~/` is resolved against the user's home
+    ///    directory (`dart pub global activate` and `dotnet tool install
+    ///    --global` both write to a per-user tool directory that is
+    ///    frequently missing from `PATH`, and that directory is not the
+    ///    project's to know);
+    /// 2. an entry containing a path separator is resolved against the
+    ///    project root (Composer installs to the project's own
+    ///    `vendor/bin`, which is never on `PATH`);
+    /// 3. anything else is searched on `PATH` as an alternate name (the tool
+    ///    a language's own install command produces under a name that does
+    ///    not match `binary`).
+    pub also: &'static [&'static str],
+
     /// Human label, used in messages and in `.arbor/scip.json`.
     pub language: &'static str,
 
@@ -87,6 +103,7 @@ pub struct Indexer {
 pub const INDEXERS: &[Indexer] = &[
     Indexer {
         binary: "scip-java",
+        also: &[],
         language: "Java/Kotlin",
         markers: &["build.gradle", "build.gradle.kts", "pom.xml"],
         weak_markers: &[],
@@ -100,6 +117,7 @@ org.scip-code:scip-java:0.13.1 --main org.scip_code.scip_java.ScipJava",
     },
     Indexer {
         binary: "rust-analyzer",
+        also: &[],
         language: "Rust",
         markers: &["Cargo.toml"],
         weak_markers: &[],
@@ -112,6 +130,7 @@ org.scip-code:scip-java:0.13.1 --main org.scip_code.scip_java.ScipJava",
     },
     Indexer {
         binary: "scip-typescript",
+        also: &[],
         language: "TypeScript/JavaScript",
         markers: &["tsconfig.json"],
         weak_markers: &[],
@@ -128,6 +147,7 @@ org.scip-code:scip-java:0.13.1 --main org.scip_code.scip_java.ScipJava",
     },
     Indexer {
         binary: "scip-python",
+        also: &[],
         language: "Python",
         markers: &[
             "pyproject.toml",
@@ -152,6 +172,7 @@ org.scip-code:scip-java:0.13.1 --main org.scip_code.scip_java.ScipJava",
     },
     Indexer {
         binary: "scip-go",
+        also: &[],
         language: "Go",
         markers: &["go.mod"],
         weak_markers: &[],
@@ -164,6 +185,11 @@ org.scip-code:scip-java:0.13.1 --main org.scip_code.scip_java.ScipJava",
     },
     Indexer {
         binary: "scip-dotnet",
+        // `dotnet tool install --global scip-dotnet` installs into
+        // `~/.dotnet/tools`, which is a per-user tool directory .NET does not
+        // add to `PATH` on every install — the same dead end the pub-cache
+        // path below fixes for Dart.
+        also: &["~/.dotnet/tools/scip-dotnet"],
         language: "C#",
         markers: &["*.sln", "*.csproj"],
         weak_markers: &[],
@@ -176,6 +202,7 @@ org.scip-code:scip-java:0.13.1 --main org.scip_code.scip_java.ScipJava",
     },
     Indexer {
         binary: "scip-clang",
+        also: &[],
         language: "C/C++",
         // Deliberately the compilation database rather than CMakeLists.txt:
         // scip-clang cannot run without one, so matching on the build script
@@ -191,6 +218,7 @@ org.scip-code:scip-java:0.13.1 --main org.scip_code.scip_java.ScipJava",
     },
     Indexer {
         binary: "scip-ruby",
+        also: &[],
         language: "Ruby",
         markers: &["Gemfile"],
         weak_markers: &[],
@@ -203,6 +231,12 @@ org.scip-code:scip-java:0.13.1 --main org.scip_code.scip_java.ScipJava",
     },
     Indexer {
         binary: "scip-php",
+        // `composer require --dev davidrjenni/scip-php` installs to the
+        // *project's own* `vendor/bin/scip-php`, per that package's
+        // `composer.json` `"bin"` entry — never onto `PATH`. Without this,
+        // the documented install leaves `on_path("scip-php")` failing
+        // forever.
+        also: &["vendor/bin/scip-php"],
         language: "PHP",
         markers: &["composer.json"],
         weak_markers: &[],
@@ -214,7 +248,19 @@ org.scip-code:scip-java:0.13.1 --main org.scip_code.scip_java.ScipJava",
         retry: None,
     },
     Indexer {
-        binary: "scip-dart",
+        // `dart pub global activate scip_dart` installs an executable named
+        // `scip_dart` — underscore, not hyphen — because that is the name
+        // `scip-dart`'s own `pubspec.yaml` declares under `executables:`.
+        // The primary name here matches what the documented install
+        // actually produces; `scip-dart` (hyphen) is kept in `also` for
+        // anyone who built the binary themselves and named it after the
+        // package instead.
+        binary: "scip_dart",
+        // Pub's own install output warns that `$HOME/.pub-cache/bin` "is not
+        // on your path" — so this entry, not the hyphenated name below, is
+        // the difference between the documented install working and a dead
+        // end. Listed first since it is what that install actually produces.
+        also: &["~/.pub-cache/bin/scip_dart", "scip-dart"],
         language: "Dart",
         markers: &["pubspec.yaml"],
         weak_markers: &[],
@@ -340,6 +386,38 @@ impl Indexer {
         self.extensions
             .iter()
             .any(|ext| present.iter().any(|found| found == ext))
+    }
+
+    /// The executable to invoke for this indexer, or `None` if it cannot be
+    /// found anywhere Arbor knows to look.
+    ///
+    /// Tries `binary` on `PATH` first, then each entry in `also` in order,
+    /// per the three cases documented on [`Self::also`]: `~/`-prefixed
+    /// against the home directory, path-separator-containing against
+    /// `project_root`, otherwise an alternate name on `PATH`.
+    ///
+    /// A `~/` entry whose home directory cannot be resolved is skipped, not
+    /// treated as an error — there may be another candidate after it.
+    ///
+    /// This is the *only* place that answers "is this indexer runnable, and
+    /// with what" — both the detection check and the actual `Command::new`
+    /// go through it, so they cannot disagree.
+    pub fn resolve_binary(&self, project_root: &Path) -> Option<PathBuf> {
+        if on_path(self.binary) {
+            return Some(PathBuf::from(self.binary));
+        }
+
+        self.also.iter().find_map(|candidate| {
+            if let Some(rest) = candidate.strip_prefix("~/") {
+                let path = dirs::home_dir()?.join(rest);
+                return is_executable(&path).then_some(path);
+            }
+            if candidate.contains('/') {
+                let path = project_root.join(candidate);
+                return is_executable(&path).then_some(path);
+            }
+            on_path(candidate).then(|| PathBuf::from(*candidate))
+        })
     }
 }
 
@@ -510,19 +588,25 @@ pub fn on_path(binary: &str) -> bool {
         return false;
     };
 
-    std::env::split_paths(&path).any(|dir| {
-        let candidate = dir.join(binary);
-        match candidate.metadata() {
-            #[cfg(unix)]
-            Ok(meta) => {
-                use std::os::unix::fs::PermissionsExt;
-                meta.is_file() && meta.permissions().mode() & 0o111 != 0
-            }
-            #[cfg(not(unix))]
-            Ok(meta) => meta.is_file(),
-            Err(_) => false,
+    std::env::split_paths(&path).any(|dir| is_executable(&dir.join(binary)))
+}
+
+/// Whether `candidate` exists and is executable.
+///
+/// Shared by `on_path` and [`Indexer::resolve_binary`]'s project-relative
+/// check, so a `vendor/bin/scip-php` that Composer wrote but that lost its
+/// executable bit is rejected the same way a missing `PATH` entry is.
+fn is_executable(candidate: &Path) -> bool {
+    match candidate.metadata() {
+        #[cfg(unix)]
+        Ok(meta) => {
+            use std::os::unix::fs::PermissionsExt;
+            meta.is_file() && meta.permissions().mode() & 0o111 != 0
         }
-    })
+        #[cfg(not(unix))]
+        Ok(meta) => meta.is_file(),
+        Err(_) => false,
+    }
 }
 
 /// A one-line summary for messages: `scip-java (Java/Kotlin), scip-typescript
@@ -766,6 +850,241 @@ mod tests {
             assert!(!indexer.install.is_empty(), "{}", indexer.binary);
             assert!(!indexer.markers.is_empty(), "{}", indexer.binary);
             assert!(!indexer.language.is_empty(), "{}", indexer.binary);
+        }
+    }
+
+    /// Serializes tests below that mutate the process's `PATH`. `cargo test`
+    /// runs tests concurrently by default, and `PATH` is process-global —
+    /// without this, two of these tests running at once could each see the
+    /// other's temporary directory.
+    static PATH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Restores `PATH` to `saved` when dropped, even if the test panics
+    /// mid-assertion — otherwise a failure here would corrupt `PATH` for
+    /// every test that runs afterward.
+    struct RestorePath(Option<std::ffi::OsString>);
+
+    impl Drop for RestorePath {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(p) => std::env::set_var("PATH", p),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+    }
+
+    /// Points `PATH` at exactly `only_dir`, returning a guard that restores
+    /// the previous value on drop.
+    fn set_path_to_only(only_dir: &Path) -> RestorePath {
+        let saved = std::env::var_os("PATH");
+        std::env::set_var("PATH", only_dir);
+        RestorePath(saved)
+    }
+
+    /// Serializes tests below that mutate the process's `HOME`, for the same
+    /// reason as `PATH_LOCK`. Always acquired after `PATH_LOCK` in tests that
+    /// need both, so two tests locking both cannot deadlock on lock order.
+    static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Restores `HOME` to `saved` when dropped, even if the test panics
+    /// mid-assertion.
+    struct RestoreHome(Option<std::ffi::OsString>);
+
+    impl Drop for RestoreHome {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
+    /// Points `HOME` at exactly `dir`, returning a guard that restores the
+    /// previous value on drop.
+    fn set_home_to(dir: &Path) -> RestoreHome {
+        let saved = std::env::var_os("HOME");
+        std::env::set_var("HOME", dir);
+        RestoreHome(saved)
+    }
+
+    /// Writes an executable shell script at `path`, creating its parent
+    /// directory if needed.
+    fn write_executable(path: &Path) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(path, perms).unwrap();
+        }
+    }
+
+    #[test]
+    fn dart_primary_binary_matches_its_documented_install() {
+        // `dart pub global activate scip_dart` produces an executable named
+        // `scip_dart` — underscore — because scip-dart's own `pubspec.yaml`
+        // declares that name under `executables:`. This is not a typo to be
+        // "fixed" back to a hyphen: `binary` must match what the documented
+        // install command actually produces, or that command leaves Arbor
+        // unable to find what it just told the user to install. `scip-dart`
+        // (hyphen) still works for anyone who built the tool themselves and
+        // named the binary after the package, via `also`.
+        let dart = by_binary("scip_dart").expect("scip_dart must be the primary binary name");
+        assert_eq!(dart.language, "Dart");
+        assert!(dart.also.contains(&"scip-dart"));
+    }
+
+    #[test]
+    fn a_project_relative_candidate_is_found() {
+        let _guard = PATH_LOCK.lock().unwrap();
+        let dir = project(&["composer.json"]);
+        write_executable(&dir.path().join("vendor/bin/scip-php"));
+
+        // An empty directory on PATH, so `scip-php` cannot be found there —
+        // only the project-relative `also` entry can succeed.
+        let empty = TempDir::new().unwrap();
+        let _restore = set_path_to_only(empty.path());
+
+        let php = by_binary("scip-php").unwrap();
+        assert_eq!(
+            php.resolve_binary(dir.path()),
+            Some(dir.path().join("vendor/bin/scip-php"))
+        );
+    }
+
+    #[test]
+    fn a_non_executable_project_relative_candidate_is_not_installed() {
+        let _guard = PATH_LOCK.lock().unwrap();
+        let dir = project(&["composer.json"]);
+        let target = dir.path().join("vendor/bin/scip-php");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, "not executable").unwrap();
+
+        let empty = TempDir::new().unwrap();
+        let _restore = set_path_to_only(empty.path());
+
+        let php = by_binary("scip-php").unwrap();
+        assert_eq!(php.resolve_binary(dir.path()), None);
+    }
+
+    #[test]
+    fn a_home_relative_candidate_is_found() {
+        // `dart pub global activate scip_dart` installs to
+        // `$HOME/.pub-cache/bin`, which Pub's own output says is not on
+        // `PATH` — this is the case that made the documented install a dead
+        // end before `also` understood `~/`.
+        let _path_guard = PATH_LOCK.lock().unwrap();
+        let _home_guard = HOME_LOCK.lock().unwrap();
+
+        let home = TempDir::new().unwrap();
+        write_executable(&home.path().join(".pub-cache/bin/scip_dart"));
+        let _restore_home = set_home_to(home.path());
+
+        // Empty PATH: neither the primary name nor the hyphenated alternate
+        // can be found there, so only the `~/` candidate can succeed.
+        let empty = TempDir::new().unwrap();
+        let _restore_path = set_path_to_only(empty.path());
+
+        let dart = by_binary("scip_dart").unwrap();
+        let project_root = TempDir::new().unwrap();
+        assert_eq!(
+            dart.resolve_binary(project_root.path()),
+            Some(home.path().join(".pub-cache/bin/scip_dart"))
+        );
+    }
+
+    #[test]
+    fn a_home_relative_candidate_that_is_not_executable_is_not_installed() {
+        let _path_guard = PATH_LOCK.lock().unwrap();
+        let _home_guard = HOME_LOCK.lock().unwrap();
+
+        let home = TempDir::new().unwrap();
+        let target = home.path().join(".pub-cache/bin/scip_dart");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, "not executable").unwrap();
+        let _restore_home = set_home_to(home.path());
+
+        let empty = TempDir::new().unwrap();
+        let _restore_path = set_path_to_only(empty.path());
+
+        let dart = by_binary("scip_dart").unwrap();
+        let project_root = TempDir::new().unwrap();
+        assert_eq!(dart.resolve_binary(project_root.path()), None);
+    }
+
+    #[test]
+    fn dart_also_includes_the_pub_cache_path() {
+        // Without this entry, `dart pub global activate scip_dart` — the
+        // exact command Arbor's own install hint prints — leaves the binary
+        // somewhere Arbor never looks, because Pub does not put it on PATH.
+        let dart = by_binary("scip_dart").unwrap();
+        assert_eq!(dart.also[0], "~/.pub-cache/bin/scip_dart");
+    }
+
+    #[test]
+    fn an_alternate_path_name_is_found_when_the_primary_is_absent() {
+        let _guard = PATH_LOCK.lock().unwrap();
+        let bin_dir = TempDir::new().unwrap();
+        write_executable(&bin_dir.path().join("alt-name"));
+        let _restore = set_path_to_only(bin_dir.path());
+
+        let indexer = Indexer {
+            binary: "primary-name-that-is-not-installed",
+            also: &["alt-name"],
+            language: "Test",
+            markers: &[],
+            weak_markers: &[],
+            extensions: &[],
+            args: &[],
+            dynamic_args: None,
+            subproject_args: None,
+            install: "n/a",
+            retry: None,
+        };
+        let project_root = TempDir::new().unwrap();
+
+        assert_eq!(
+            indexer.resolve_binary(project_root.path()),
+            Some(PathBuf::from("alt-name"))
+        );
+    }
+
+    #[test]
+    fn every_also_entry_is_well_formed() {
+        // A malformed row must fail here rather than break one project type
+        // silently: an absolute path would ignore the project root, `..`
+        // would walk outside it, and a backslash is not a path separator for
+        // the forward-slash join `resolve_binary` does. `~/` is the one
+        // permitted absolute-looking prefix — it is resolved against the
+        // home directory, not the project root — so anything else starting
+        // with `~` (a different user's home) or `/` is rejected.
+        for indexer in INDEXERS {
+            for entry in indexer.also {
+                if entry.strip_prefix("~/").is_none() {
+                    assert!(
+                        !entry.starts_with('/'),
+                        "{}: also entry {entry:?} must not be absolute",
+                        indexer.binary
+                    );
+                    assert!(
+                        !entry.starts_with('~'),
+                        "{}: also entry {entry:?} must use exactly ~/ for a home-relative path",
+                        indexer.binary
+                    );
+                }
+                assert!(
+                    !entry.split('/').any(|part| part == ".."),
+                    "{}: also entry {entry:?} must not walk up with ..",
+                    indexer.binary
+                );
+                assert!(
+                    !entry.contains('\\'),
+                    "{}: also entry {entry:?} must use forward slashes",
+                    indexer.binary
+                );
+            }
         }
     }
 }

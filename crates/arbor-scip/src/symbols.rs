@@ -17,8 +17,11 @@
 //! classify one. Everything else here is language-neutral.
 
 use arbor_core::NodeKind;
+use protobuf::Enum;
 use scip::symbol::parse_symbol;
-use scip::types::{descriptor::Suffix, symbol_information, Descriptor, SymbolInformation};
+use scip::types::{
+    descriptor::Suffix, symbol_information, Descriptor, Language, SymbolInformation,
+};
 
 /// What a SCIP symbol string means in Arbor's terms.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,16 +83,57 @@ impl Default for SymbolStyle {
     }
 }
 
+/// Decodes a raw `Document.language` field into the name it is supposed to
+/// hold, or `None` if there is effectively no usable language to report.
+///
+/// The proto documents `language` as a *string name* (`scip.proto`: "The
+/// `Language` enum contains the names of most common programming languages
+/// ... typed as a string to permit any programming language"), but
+/// `scip-php` writes the numeric enum value instead (`"19"` for
+/// `Language::PHP`). An all-digit field is decoded through the enum rather
+/// than trusted as a name — if the enum recognises it, its variant name
+/// (`PHP`) is the true language; if it does not (a value from a newer schema,
+/// or garbage), the field is treated the same as empty, i.e. absent, so a
+/// caller's own scheme-based fallback gets a chance instead of a bare number
+/// leaking into a report or a style lookup.
+///
+/// This is the single decode point: both the stats line and [`style_for`]
+/// are meant to be fed the result of this function rather than the raw
+/// field, so they cannot disagree about what a document's language is.
+pub fn resolve_document_language(language: &str) -> Option<String> {
+    if language.is_empty() {
+        return None;
+    }
+
+    if language.bytes().all(|b| b.is_ascii_digit()) {
+        return language
+            .parse::<i32>()
+            .ok()
+            .and_then(Language::from_i32)
+            .map(|lang| format!("{lang:?}"));
+    }
+
+    Some(language.to_string())
+}
+
 /// Picks a style for one document.
 ///
-/// Keys on SCIP's own `Document.language`, which is the semantically correct
-/// field and is standardised. `sample_symbol` is a fallback for indexers that
-/// leave the language blank — the symbol's scheme names the indexer, which
-/// implies the language just as well.
+/// Keys on SCIP's own `Document.language` — already decoded by
+/// [`resolve_document_language`], since a caller reading it straight off the
+/// index would reintroduce the numeric-vs-name bug this module works around.
+/// `sample_symbol` is a fallback for indexers that leave the language blank,
+/// or (see below) put something in it Arbor doesn't recognise — the symbol's
+/// scheme names the indexer, which implies the language just as well.
 pub fn style_for(language: &str, sample_symbol: Option<&str>) -> SymbolStyle {
     let normalized = normalize(language);
     if !normalized.is_empty() {
-        return style_for_language(&normalized);
+        if let Some(style) = style_for_language(&normalized) {
+            return style;
+        }
+        // A non-empty language we don't recognise is not treated as "use the
+        // default and stop": that discards information Arbor might still be
+        // able to recover. Fall through to the same scheme-based guess used
+        // for a blank field, below.
     }
 
     let scheme = sample_symbol
@@ -105,8 +149,9 @@ pub fn style_for(language: &str, sample_symbol: Option<&str>) -> SymbolStyle {
         "scip-clang" => style_for_language("cpp"),
         "scip-ruby" => style_for_language("ruby"),
         "scip-php" => style_for_language("php"),
-        _ => SymbolStyle::default(),
+        _ => None,
     }
+    .unwrap_or_default()
 }
 
 /// The language an indexer covers, named from its scheme.
@@ -141,51 +186,55 @@ fn normalize(language: &str) -> String {
         .collect()
 }
 
-fn style_for_language(normalized: &str) -> SymbolStyle {
+/// `None` means the name is not one of the languages Arbor knows a style
+/// for — distinct from "known, and its style happens to be the default" —
+/// so [`style_for`] can tell whether to keep looking (the scheme fallback)
+/// or stop.
+fn style_for_language(normalized: &str) -> Option<SymbolStyle> {
     match normalized {
         // `<init>` is how the JVM names a constructor; SCIP emits it as an
         // ordinary method, but callers reason about it as construction.
-        "java" | "kotlin" | "scala" | "groovy" => SymbolStyle {
+        "java" | "kotlin" | "scala" | "groovy" => Some(SymbolStyle {
             separator: ".",
             ctor_names: &["<init>"],
             unwrap_impl_blocks: false,
-        },
+        }),
         "typescript" | "javascript" | "typescriptreact" | "javascriptreact" | "flow" => {
-            SymbolStyle {
+            Some(SymbolStyle {
                 separator: ".",
                 ctor_names: &["constructor"],
                 unwrap_impl_blocks: false,
-            }
+            })
         }
-        "python" => SymbolStyle {
+        "python" => Some(SymbolStyle {
             separator: ".",
             ctor_names: &["__init__"],
             unwrap_impl_blocks: false,
-        },
-        "ruby" => SymbolStyle {
+        }),
+        "ruby" => Some(SymbolStyle {
             separator: ".",
             ctor_names: &["initialize"],
             unwrap_impl_blocks: false,
-        },
-        "php" => SymbolStyle {
+        }),
+        "php" => Some(SymbolStyle {
             separator: ".",
             ctor_names: &["__construct"],
             unwrap_impl_blocks: false,
-        },
+        }),
         // Rust's `new` is a convention, not a constructor — rust-analyzer emits
         // it as the plain associated function it is, and calling it a
         // constructor here would invent a distinction the language lacks.
-        "rust" => SymbolStyle {
+        "rust" => Some(SymbolStyle {
             separator: "::",
             ctor_names: &[],
             unwrap_impl_blocks: true,
-        },
-        "cpp" | "objectivecpp" | "cuda" => SymbolStyle {
+        }),
+        "cpp" | "objectivecpp" | "cuda" => Some(SymbolStyle {
             separator: "::",
             ctor_names: &[],
             unwrap_impl_blocks: false,
-        },
-        _ => SymbolStyle::default(),
+        }),
+        _ => None,
     }
 }
 
@@ -723,5 +772,53 @@ mod tests {
         assert!(is_callable(NodeKind::Method));
         assert!(is_callable(NodeKind::Constructor));
         assert!(!is_callable(NodeKind::Class));
+    }
+
+    #[test]
+    fn resolve_document_language_decodes_the_numeric_enum_value() {
+        // scip-php writes the numeric `Language` enum value (PHP = 19) into
+        // `Document.language`, where the schema documents a string name.
+        assert_eq!(resolve_document_language("19"), Some("PHP".to_string()));
+    }
+
+    #[test]
+    fn resolve_document_language_treats_an_unknown_number_as_absent() {
+        // A value the enum doesn't know — garbage, or a newer schema — must
+        // not leak through as a fake language name; the caller's own
+        // scheme-based fallback is meant to get a turn instead.
+        assert_eq!(resolve_document_language("9999"), None);
+    }
+
+    #[test]
+    fn resolve_document_language_passes_a_real_name_through() {
+        assert_eq!(resolve_document_language("PHP"), Some("PHP".to_string()));
+        assert_eq!(resolve_document_language("Java"), Some("Java".to_string()));
+    }
+
+    #[test]
+    fn resolve_document_language_treats_empty_as_absent() {
+        assert_eq!(resolve_document_language(""), None);
+    }
+
+    #[test]
+    fn php_as_a_proper_string_still_gets_phps_style() {
+        let style = style_for("PHP", None);
+        assert_eq!(style.ctor_names, &["__construct"]);
+        assert_eq!(style.separator, ".");
+    }
+
+    #[test]
+    fn unrecognised_nonnumeric_language_falls_through_to_the_scheme() {
+        // The root cause, independent of the numeric bug: previously any
+        // non-empty, unrecognised language returned `SymbolStyle::default()`
+        // immediately, discarding a scheme that could have named the real
+        // language. `scip-php`'s numeric "19" is one way to trigger this, but
+        // any indexer that writes something odd into `Document.language`
+        // must degrade the same way.
+        let style = style_for(
+            "Brainfuck",
+            Some("scip-php composer app 1.0.0 App/Foo#__construct()."),
+        );
+        assert_eq!(style.ctor_names, &["__construct"]);
     }
 }

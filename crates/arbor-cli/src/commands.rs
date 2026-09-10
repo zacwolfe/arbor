@@ -303,7 +303,7 @@ fn auto_rebuild_scip(project_root: &Path, indexes: &[String]) -> Result<()> {
     let detected = crate::indexers::detect(project_root);
     let runnable: Vec<_> = detected
         .iter()
-        .filter(|d| d.is_runnable() && crate::indexers::on_path(d.indexer.binary))
+        .filter(|d| d.is_runnable() && d.indexer.resolve_binary(project_root).is_some())
         .cloned()
         .collect();
 
@@ -417,7 +417,7 @@ fn runnable_indexers(project_root: &Path) -> Result<Vec<crate::indexers::Detecte
     let detected = crate::indexers::detect(project_root);
     let runnable: Vec<_> = detected
         .iter()
-        .filter(|d| d.is_runnable() && crate::indexers::on_path(d.indexer.binary))
+        .filter(|d| d.is_runnable() && d.indexer.resolve_binary(project_root).is_some())
         .cloned()
         .collect();
 
@@ -1702,7 +1702,7 @@ pub fn scip_background_worker(root: &Path, merge: bool, no_dispatch: bool) -> Re
     let detected = crate::indexers::detect(&resolved_path);
     let runnable: Vec<_> = detected
         .iter()
-        .filter(|d| d.is_runnable() && crate::indexers::on_path(d.indexer.binary))
+        .filter(|d| d.is_runnable() && d.indexer.resolve_binary(&resolved_path).is_some())
         .cloned()
         .collect();
 
@@ -4514,10 +4514,11 @@ const MAX_HIERARCHY_DEPTH: usize = 4;
 /// The interesting part is not the traversal, it is the empty result. Only a
 /// compiler index carries a type hierarchy, so on a Tree-sitter graph the honest
 /// answer is "this graph has no inheritance edges", never "nothing implements
-/// this" — and some SCIP indexers (`rust-analyzer`) emit no implementation
-/// relationships either. Reporting those two as "none found" would be the same
-/// absence-as-evidence mistake `refactor` used to make, in a place where a user
-/// is deciding whether an interface is safe to change.
+/// this" — and some SCIP indexers (`rust-analyzer` and `scip-dotnet` are two)
+/// emit no implementation relationships either. Reporting those two as "none
+/// found" would be the same absence-as-evidence mistake `refactor` used to
+/// make, in a place where a user is deciding whether an interface is safe to
+/// change.
 pub fn implementors(symbol: &str, path: &Path, transitive: bool, json_output: bool) -> Result<()> {
     let resolved_path = resolve_project_path(path)?;
     let graph = load_or_index_graph(&resolved_path)?;
@@ -4589,7 +4590,7 @@ hierarchy: arbor scip <index.scip>"
             ),
             scip_reason: format!(
                 "The indexer that produced it emits no implementation relationships — \
-rust-analyzer is one such. That is not evidence that '{symbol}' has no implementors."
+rust-analyzer and scip-dotnet are two such. That is not evidence that '{symbol}' has no implementors."
             ),
         }
         .report();
@@ -4677,8 +4678,9 @@ struct RelationshipAbsence<'a> {
     /// construct, so theirs stays generic.
     tree_sitter_reason: String,
     /// Fully-formed SCIP sentence for why an indexer might still emit none of
-    /// this kind. `implementors`/`supertypes` name `rust-analyzer`, the
-    /// concrete indexer known to skip it; the other two stay generic.
+    /// this kind. `implementors`/`supertypes` name `rust-analyzer` and
+    /// `scip-dotnet`, the concrete indexers known to skip it; the other two
+    /// stay generic.
     scip_reason: String,
 }
 
@@ -4983,10 +4985,11 @@ every indexer measured."
 /// same edges [`implementors`] reads.
 ///
 /// Same availability question as `implementors`: Tree-sitter cannot resolve
-/// `class Middle(Base)` into an edge, and some SCIP indexers (`rust-analyzer`)
-/// emit no implementation relationships either. `--transitive` walks up to the
-/// hierarchy root — interface → abstract base → concrete class is ordinary,
-/// and the answer usually wanted is every level, not just the direct parent.
+/// `class Middle(Base)` into an edge, and some SCIP indexers (`rust-analyzer`
+/// and `scip-dotnet` are two) emit no implementation relationships either.
+/// `--transitive` walks up to the hierarchy root — interface → abstract base
+/// → concrete class is ordinary, and the answer usually wanted is every
+/// level, not just the direct parent.
 pub fn supertypes(
     symbol: &str,
     path: &Path,
@@ -5070,8 +5073,8 @@ an edge, so '{symbol}' would look like it extends nothing either way. A compiler
 carries the hierarchy: arbor scip <index.scip>"
             ),
             scip_reason: format!(
-                "Some indexers emit no implementation relationships — rust-analyzer is \
-one such. That is not evidence that '{symbol}' has none."
+                "Some indexers emit no implementation relationships — rust-analyzer and \
+scip-dotnet are two such. That is not evidence that '{symbol}' has none."
             ),
         }
         .report();
@@ -6151,29 +6154,93 @@ fn map_extract_param_names(params_str: &str, style: ParamNameStyle) -> Vec<&str>
     let mut depth: i32 = 0;
     let mut start = 0;
 
+    // `{}`/`[]` share the depth counter with `<>`/`()`: Dart's named-param
+    // group (`{...}`) and optional-positional group (`[...]`) must not leak
+    // their braces into a name, and a comma inside one of these groups is
+    // not a parameter separator.
     let bytes = params_str.as_bytes();
     for i in 0..bytes.len() {
         match bytes[i] {
-            b'<' | b'(' => depth += 1,
-            b'>' | b')' => depth -= 1,
+            b'<' | b'(' | b'{' | b'[' => depth += 1,
+            b'>' | b')' | b'}' | b']' => depth -= 1,
             b',' if depth == 0 => {
-                if let Some(name) = map_param_name(&params_str[start..i], style) {
-                    names.push(name);
-                }
+                map_push_param_names(&params_str[start..i], style, &mut names);
                 start = i + 1;
             }
             _ => {}
         }
     }
-    if let Some(name) = map_param_name(&params_str[start..], style) {
-        names.push(name);
-    }
+    map_push_param_names(&params_str[start..], style, &mut names);
 
     names
 }
 
+/// Pushes the name(s) found in one comma-delimited chunk. A chunk that is
+/// *entirely* a `{...}`/`[...]` group (Dart's named or optional-positional
+/// parameter group) is unwrapped and re-split, since such a group holds
+/// several parameters, not one — `{b, c}` contributes both `b` and `c`.
+fn map_push_param_names<'a>(chunk: &'a str, style: ParamNameStyle, names: &mut Vec<&'a str>) {
+    let trimmed = chunk.trim();
+    if let Some(inner) = map_strip_group_wrapper(trimmed) {
+        names.extend(map_extract_param_names(inner, style));
+        return;
+    }
+    if let Some(name) = map_param_name(trimmed, style) {
+        names.push(name);
+    }
+}
+
+/// If `chunk` is a single balanced `{...}` or `[...]` group spanning the
+/// whole chunk, returns its inside. A chunk that merely *contains* such a
+/// group partway through (e.g. a default value like `const {'a': 1}`) is
+/// not a wrapper and returns `None` — only a leading bracket that closes at
+/// the very end counts.
+fn map_strip_group_wrapper(chunk: &str) -> Option<&str> {
+    let mut chars = chunk.char_indices();
+    let (_, first) = chars.next()?;
+    let close = match first {
+        '{' => '}',
+        '[' => ']',
+        _ => return None,
+    };
+    let mut depth = 1i32;
+    for (i, c) in chars {
+        if c == first {
+            depth += 1;
+        } else if c == close {
+            depth -= 1;
+            if depth == 0 {
+                let end = i + close.len_utf8();
+                return if end == chunk.len() {
+                    Some(&chunk[first.len_utf8()..i])
+                } else {
+                    None
+                };
+            }
+        }
+    }
+    None
+}
+
+/// Returns the slice of `s` up to (not including) the first `=` that sits
+/// outside any `<>`/`()`/`{}`/`[]` group, so a default value's own `=` never
+/// leaks in but nothing nested inside it (a comma, another `=`) is mistaken
+/// for a top-level one.
+fn map_cut_at_top_level_eq(s: &str) -> &str {
+    let mut depth: i32 = 0;
+    for (i, c) in s.char_indices() {
+        match c {
+            '<' | '(' | '{' | '[' => depth += 1,
+            '>' | ')' | '}' | ']' => depth -= 1,
+            '=' if depth == 0 => return &s[..i],
+            _ => {}
+        }
+    }
+    s
+}
+
 fn map_param_name(param: &str, style: ParamNameStyle) -> Option<&str> {
-    let trimmed = param.trim();
+    let trimmed = map_cut_at_top_level_eq(param.trim()).trim();
     if trimmed.is_empty() {
         return None;
     }
@@ -6264,6 +6331,51 @@ mod map_shorten_signature_tests {
         let sig = "some unrelated signature text with (parens, in, it)";
         let result = map_shorten_signature("doesNotAppear", sig, "x.go");
         assert_eq!(result, sig);
+    }
+
+    #[test]
+    fn dart_named_group_with_default_value() {
+        let sig = "void display(String input, {DisplayLevel level = DisplayLevel.warn})";
+        assert_eq!(
+            map_shorten_signature("display", sig, "utils.dart"),
+            "display(input, level)"
+        );
+    }
+
+    #[test]
+    fn dart_optional_positional_group() {
+        let sig = "String greet(String name, [String? title])";
+        assert_eq!(
+            map_shorten_signature("greet", sig, "utils.dart"),
+            "greet(name, title)"
+        );
+    }
+
+    #[test]
+    fn dart_required_named_group() {
+        let sig = "void f({required int a, required int b})";
+        assert_eq!(map_shorten_signature("f", sig, "utils.dart"), "f(a, b)");
+    }
+
+    #[test]
+    fn python_default_value() {
+        let sig = "def f(self, a, b=None)";
+        assert_eq!(map_shorten_signature("f", sig, "x.py"), "f(self, a, b)");
+    }
+
+    #[test]
+    fn typescript_default_value() {
+        // `a: string` is handled by the colon arm (name before `:`); `b = 3`
+        // has no colon, so it falls to the Other/last-word arm once the
+        // `= 3` default is cut off, leaving just `b`.
+        let sig = "function f(a: string, b = 3)";
+        assert_eq!(map_shorten_signature("f", sig, "x.ts"), "f(a, b)");
+    }
+
+    #[test]
+    fn default_value_with_comma_inside_group_is_one_param() {
+        let sig = "void f({Map<String, int> m = const {'a': 1, 'b': 2}})";
+        assert_eq!(map_shorten_signature("f", sig, "utils.dart"), "f(m)");
     }
 }
 

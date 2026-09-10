@@ -190,12 +190,21 @@ pub fn ingest_indexes(indexes: &[(PathBuf, Index)], options: &IngestOptions) -> 
 
         for document in &index.documents {
             stats.documents += 1;
-            // Not every indexer sets `Document.language`; `scip-python` leaves
-            // it empty. Falling back to the scheme keeps the report honest
-            // rather than blank.
-            let language = match document.language.is_empty() {
-                false => Some(document.language.clone()),
-                true => document
+            // `Document.language` gets one decode here, and both the stats
+            // line and the style lookup are fed the result — two independent
+            // decodes could disagree about what a document's language is,
+            // which is exactly the shape of the `scip-php` bug this works
+            // around (see `symbols::resolve_document_language`).
+            //
+            // Not every indexer sets the field at all — `scip-python` leaves
+            // it empty — and `scip-php` fills it with the numeric `Language`
+            // enum value instead of the name the schema asks for. Both cases
+            // fall back to the symbol scheme, which names the indexer and so
+            // implies the language just as well.
+            let resolved_language = symbols::resolve_document_language(&document.language);
+            let language = match &resolved_language {
+                Some(language) => Some(language.clone()),
+                None => document
                     .occurrences
                     .first()
                     .and_then(|o| symbols::language_from_scheme(&o.symbol))
@@ -208,7 +217,7 @@ pub fn ingest_indexes(indexes: &[(PathBuf, Index)], options: &IngestOptions) -> 
             }
 
             let style = symbols::style_for(
-                &document.language,
+                resolved_language.as_deref().unwrap_or(""),
                 document.occurrences.first().map(|o| o.symbol.as_str()),
             );
 
@@ -341,28 +350,119 @@ fn build_node(
     );
 
     if let Some(info) = info {
-        if let Some(signature) = info
+        let signature_field = info
             .signature_documentation
             .as_ref()
             .map(|sig| sig.text.as_str())
             .filter(|text| !text.is_empty())
-        {
-            node = node.with_signature(signature);
-        }
+            .map(str::to_string);
 
         let documentation = info
             .documentation
             .iter()
             .filter(|doc| !doc.is_empty())
             .cloned()
-            .collect::<Vec<_>>();
+            .collect::<Vec<_>>()
+            .join("\n");
 
-        if !documentation.is_empty() {
-            node.docstring = Some(documentation.join("\n"));
+        // `scip-java` populates `signature_documentation`, so its hover
+        // `documentation` is prose and `signature_field` always wins there.
+        // `scip-dotnet` never populates `signature_documentation` and instead
+        // puts the signature in the first fenced block of `documentation`,
+        // per the usual markdown-hover convention. Reading both is what lets
+        // one code path serve both indexers instead of favouring the JVM one.
+        let (signature, remaining_docs) = match signature_field {
+            Some(signature) => (Some(signature), non_empty(documentation)),
+            None => match extract_fenced_signature(&documentation) {
+                Some((signature, remaining)) => (Some(signature), remaining),
+                None => (None, non_empty(documentation)),
+            },
+        };
+
+        if let Some(signature) = signature {
+            node = node.with_signature(signature);
         }
+        node.docstring = remaining_docs;
     }
 
     node
+}
+
+/// `Some(text)` unless it is empty — keeps `docstring` `None` rather than
+/// `Some(String::new())` when there is nothing left to say.
+fn non_empty(text: String) -> Option<String> {
+    match text.is_empty() {
+        true => None,
+        false => Some(text),
+    }
+}
+
+/// Length cap for a signature pulled out of a hover-doc fenced block.
+///
+/// A generic-heavy type's hover text can run for paragraphs; `CodeNode::signature`
+/// is displayed inline in `arbor map`/`inspect`, so a signature nobody can read
+/// is worse than none, but silently storing kilobytes in every node is worse still.
+const MAX_FENCED_SIGNATURE_LEN: usize = 200;
+
+/// Pulls a signature out of the first fenced code block in hover-markdown
+/// `documentation`, for indexers that never populate
+/// `SymbolInformation.signature_documentation` (`scip-dotnet`) and instead
+/// put the signature in the first fenced block of the hover text — the usual
+/// convention for that field.
+///
+/// Returns the block collapsed to one line (fence markers and any language
+/// tag stripped) plus whatever documentation text remains once the block is
+/// removed, so the signature is not duplicated into `docstring`. `None` if
+/// `text` has no fenced block at all — the caller then treats `text` as
+/// plain documentation, unchanged.
+fn extract_fenced_signature(text: &str) -> Option<(String, Option<String>)> {
+    let fence_start = text.find("```")?;
+    let before = text[..fence_start].trim();
+    let after_open = &text[fence_start + 3..];
+
+    // The opening fence's own line may carry a language tag (`cs`,
+    // `csharp`, `go`, or none); skip past it to the block's actual content.
+    let content_start = after_open.find('\n').map(|idx| idx + 1).unwrap_or(0);
+    let content_area = &after_open[content_start..];
+
+    let fence_end = content_area.find("```")?;
+    let block = &content_area[..fence_end];
+    let after_close = content_area[fence_end + 3..].trim();
+
+    let signature = collapse_whitespace(block);
+    if signature.is_empty() {
+        return None;
+    }
+    let signature = cap_len(signature, MAX_FENCED_SIGNATURE_LEN);
+
+    let remaining = match (before.is_empty(), after_close.is_empty()) {
+        (true, true) => None,
+        (true, false) => Some(after_close.to_string()),
+        (false, true) => Some(before.to_string()),
+        (false, false) => Some(format!("{before}\n{after_close}")),
+    };
+
+    Some((signature, remaining))
+}
+
+/// Collapses a (possibly multi-line) block to a single line: any run of
+/// whitespace becomes one space. `CodeNode::signature` is displayed inline,
+/// and a multi-line hover block would wreck `arbor map`'s one-line-per-symbol
+/// layout.
+fn collapse_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Truncates to `max_chars`, appending `...` if anything was cut.
+/// Character-counted, not byte-counted, so a multi-byte identifier at the
+/// boundary cannot split mid-character and panic.
+fn cap_len(text: String, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text;
+    }
+    let mut capped: String = text.chars().take(max_chars).collect();
+    capped.push_str("...");
+    capped
 }
 
 /// Pass 2 for one document.
@@ -558,7 +658,7 @@ fn absolute_file(project_root: &Path, relative_path: &str) -> String {
 mod tests {
     use super::*;
     use scip::types::{
-        occurrence, MultiLineRange, Occurrence, Relationship, SingleLineRange, ToolInfo,
+        occurrence, MultiLineRange, Occurrence, Relationship, Signature, SingleLineRange, ToolInfo,
     };
 
     const GATEWAY: &str = "semanticdb maven . . com/example/Gateway#charge().";
@@ -624,6 +724,25 @@ mod tests {
         occurrence.symbol = symbol.to_string();
         occurrence.range = vec![line, 8, 30];
         occurrence
+    }
+
+    /// A `SymbolInformation` carrying hover-style `documentation` and/or the
+    /// dedicated `signature_documentation` field, for the fenced-block
+    /// fallback tests below.
+    fn symbol_info_with_docs(
+        symbol: &str,
+        documentation: &[&str],
+        signature: Option<&str>,
+    ) -> SymbolInformation {
+        let mut info = SymbolInformation::new();
+        info.symbol = symbol.to_string();
+        info.documentation = documentation.iter().map(|d| d.to_string()).collect();
+        if let Some(text) = signature {
+            let mut sig = Signature::new();
+            sig.text = text.to_string();
+            info.signature_documentation = protobuf::MessageField::some(sig);
+        }
+        info
     }
 
     fn symbol_info(symbol: &str, implements: &[&str]) -> SymbolInformation {
@@ -873,6 +992,52 @@ mod tests {
         assert_eq!(kinds, vec![EdgeKind::UsesType]);
     }
 
+    /// `scip-php` writes the numeric `Language` enum value (PHP = 19) into
+    /// `Document.language`, where the schema documents a string name.
+    fn document_with_language(
+        path: &str,
+        language: &str,
+        occurrences: Vec<Occurrence>,
+    ) -> Document {
+        let mut document = Document::new();
+        document.relative_path = path.to_string();
+        document.language = language.to_string();
+        document.occurrences = occurrences;
+        document
+    }
+
+    #[test]
+    fn numeric_document_language_decodes_to_the_enum_name() {
+        const PHP_CTOR: &str = "scip-php composer app 1.0.0 App/Foo#__construct().";
+
+        let result = run(vec![document_with_language(
+            "App/Foo.php",
+            "19",
+            vec![definition(PHP_CTOR, 3, 6)],
+        )]);
+
+        assert_eq!(result.stats.languages, vec!["PHP".to_string()]);
+        // Getting PHP's SymbolStyle, not the default, is what makes this a
+        // Constructor rather than an ordinary method.
+        assert_eq!(result.nodes[0].kind, NodeKind::Constructor);
+    }
+
+    #[test]
+    fn unknown_numeric_document_language_falls_back_to_the_scheme() {
+        const PHP_CTOR: &str = "scip-php composer app 1.0.0 App/Foo#__construct().";
+
+        let result = run(vec![document_with_language(
+            "App/Foo.php",
+            "9999",
+            vec![definition(PHP_CTOR, 3, 6)],
+        )]);
+
+        // "9999" is not a language the enum knows, so it is treated as
+        // absent — the scheme fallback recovers "PHP", not the raw number.
+        assert_eq!(result.stats.languages, vec!["PHP".to_string()]);
+        assert_eq!(result.nodes[0].kind, NodeKind::Constructor);
+    }
+
     #[test]
     fn tool_and_language_metadata_is_reported() {
         let result = run(vec![document(
@@ -962,5 +1127,131 @@ mod tests {
         assert_eq!(stats.references_unattributed, 1);
         assert_eq!(stats.references_without_range, 1);
         assert_eq!(stats.references_self, 1);
+    }
+
+    /// `scip-dotnet` never populates `signature_documentation`; it puts the
+    /// signature in the first fenced block of hover `documentation` instead.
+    #[test]
+    fn fenced_block_only_becomes_signature_without_fences() {
+        let result = run(vec![document(
+            "Gateway.java",
+            vec![definition(GATEWAY, 9, 12)],
+            vec![symbol_info_with_docs(
+                GATEWAY,
+                &["```cs\nprivate ScipSymbol Foo(ISymbol? sym)\n```"],
+                None,
+            )],
+        )]);
+
+        let node = &result.nodes[0];
+        assert_eq!(
+            node.signature.as_deref(),
+            Some("private ScipSymbol Foo(ISymbol? sym)")
+        );
+    }
+
+    #[test]
+    fn fenced_block_and_nothing_else_leaves_docstring_none() {
+        let result = run(vec![document(
+            "Gateway.java",
+            vec![definition(GATEWAY, 9, 12)],
+            vec![symbol_info_with_docs(
+                GATEWAY,
+                &["```cs\nprivate ScipSymbol Foo(ISymbol? sym)\n```"],
+                None,
+            )],
+        )]);
+
+        assert_eq!(result.nodes[0].docstring, None);
+    }
+
+    #[test]
+    fn fenced_block_with_trailing_prose_splits_signature_and_docstring() {
+        let result = run(vec![document(
+            "Gateway.java",
+            vec![definition(GATEWAY, 9, 12)],
+            vec![symbol_info_with_docs(
+                GATEWAY,
+                &["```cs\nprivate ScipSymbol Foo(ISymbol? sym)\n```\nDoes the thing."],
+                None,
+            )],
+        )]);
+
+        let node = &result.nodes[0];
+        assert_eq!(
+            node.signature.as_deref(),
+            Some("private ScipSymbol Foo(ISymbol? sym)")
+        );
+        assert_eq!(node.docstring.as_deref(), Some("Does the thing."));
+    }
+
+    #[test]
+    fn signature_documentation_field_wins_over_fenced_block() {
+        let result = run(vec![document(
+            "Gateway.java",
+            vec![definition(GATEWAY, 9, 12)],
+            vec![symbol_info_with_docs(
+                GATEWAY,
+                &["```cs\nprivate ScipSymbol Foo(ISymbol? sym)\n```"],
+                Some("void charge()"),
+            )],
+        )]);
+
+        let node = &result.nodes[0];
+        assert_eq!(node.signature.as_deref(), Some("void charge()"));
+        // scip-java's own field wins; the fenced block in `documentation`
+        // (prose there, for scip-java) is left as-is rather than mined.
+        assert_eq!(
+            node.docstring.as_deref(),
+            Some("```cs\nprivate ScipSymbol Foo(ISymbol? sym)\n```")
+        );
+    }
+
+    #[test]
+    fn multiline_fenced_block_collapses_to_one_line() {
+        let result = run(vec![document(
+            "Gateway.java",
+            vec![definition(GATEWAY, 9, 12)],
+            vec![symbol_info_with_docs(
+                GATEWAY,
+                &["```cs\nprivate ScipSymbol Foo(\n    ISymbol? sym)\n```"],
+                None,
+            )],
+        )]);
+
+        assert_eq!(
+            result.nodes[0].signature.as_deref(),
+            Some("private ScipSymbol Foo( ISymbol? sym)")
+        );
+    }
+
+    #[test]
+    fn documentation_without_a_fence_is_unchanged() {
+        let result = run(vec![document(
+            "Gateway.java",
+            vec![definition(GATEWAY, 9, 12)],
+            vec![symbol_info_with_docs(GATEWAY, &["Charges the card."], None)],
+        )]);
+
+        let node = &result.nodes[0];
+        assert_eq!(node.signature, None);
+        assert_eq!(node.docstring.as_deref(), Some("Charges the card."));
+    }
+
+    #[test]
+    fn overlong_fenced_block_is_capped() {
+        let long_signature = "x".repeat(500);
+        let block = format!("```cs\n{long_signature}\n```");
+
+        let result = run(vec![document(
+            "Gateway.java",
+            vec![definition(GATEWAY, 9, 12)],
+            vec![symbol_info_with_docs(GATEWAY, &[&block], None)],
+        )]);
+
+        let signature = result.nodes[0].signature.clone().expect("signature");
+        assert_eq!(signature.len(), 203); // 200 chars + "..."
+        assert!(signature.ends_with("..."));
+        assert!(signature.starts_with(&"x".repeat(200)));
     }
 }

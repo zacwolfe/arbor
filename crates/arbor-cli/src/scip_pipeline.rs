@@ -124,7 +124,7 @@ pub fn rebuild(project_root: &Path) -> std::io::Result<Rebuild> {
     let detected = crate::indexers::detect(project_root);
     let (available, missing): (Vec<_>, Vec<_>) = detected
         .into_iter()
-        .partition(|d| d.is_runnable() && crate::indexers::on_path(d.indexer.binary));
+        .partition(|d| d.is_runnable() && d.indexer.resolve_binary(project_root).is_some());
 
     // Previously collected indexes are cleared first so a module that no longer
     // exists cannot leave one behind to be ingested forever.
@@ -169,14 +169,27 @@ struct Invocation {
 }
 
 fn invoke(project_root: &Path, indexer: &Indexer, args: &[String]) -> std::io::Result<Invocation> {
-    let output = Command::new(indexer.binary)
+    // Resolved rather than `indexer.binary` directly: for scip-php and
+    // scip-dart the runnable executable is not `binary` itself but a
+    // project-relative path or an alternate PATH name — see
+    // `Indexer::resolve_binary`. Detection (`rebuild`, above) and invocation
+    // must agree on where the executable is, or Arbor either reports an
+    // indexer it cannot run or refuses one it could.
+    let resolved = indexer.resolve_binary(project_root).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("{} is not installed", indexer.binary),
+        )
+    })?;
+
+    let output = Command::new(&resolved)
         .args(args)
         .current_dir(project_root)
         .output()?;
 
     let combined = format!(
         "$ {} {}\n{}{}",
-        indexer.binary,
+        resolved.display(),
         args.join(" "),
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)

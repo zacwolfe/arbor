@@ -38,18 +38,24 @@ how scopes are spelled (`.` versus `::`) and what an indexer calls a constructor
 | TypeScript, JavaScript | [`scip-typescript`] | **verified** on a Rust + TypeScript project, both languages in one graph |
 | Python | [`scip-python`] | **verified** on an 80-document project — 1,678 nodes, 3,590 edges |
 | Go | [`scip-go`] | **verified** on an 86-document module — 1,097 nodes, 4,689 edges, 88 interface implementations |
+| C# | [`scip-dotnet`] | **verified** on a 20-document project — 652 nodes, 1,660 edges; no type hierarchy |
+| Dart | [`scip-dart`] | **verified** on a 20-document project — 707 nodes, 2,161 edges; no type hierarchy |
+| PHP | [`scip-php`] | **verified** on a 50-document project — 707 nodes, 1,642 edges; no type hierarchy |
 | C, C++ | [`scip-clang`] | ingests; bring your own index |
-| C# | [`scip-dotnet`] | ingests; bring your own index |
 | Ruby | [`scip-ruby`] | ingests; bring your own index |
-| PHP | [`scip-php`] | ingests; bring your own index |
-| Dart | [`scip-dart`] | ingests; bring your own index |
 
 "Bring your own index" means the ingestion path is shared and exercised by unit
 tests, but no one has run that indexer end to end on a real repository and
 checked the result. Expect it to work; report it if it does not.
 
-**Arbor can run any of them** — see below — but only the three marked *verified*
-have been driven end to end.
+**Arbor can run any of them** — see below — but only the eight marked *verified*
+have been driven end to end. "No type hierarchy" on a row means that indexer emits
+no `is_implementation` relationships, so `arbor implementors` and `supertypes`
+report that the question cannot be answered rather than returning an empty list.
+
+Every one of the last three was verified against **the indexer's own source
+tree** — already cloned, idiomatic for its language, and its authors care that it
+parses. Cheapest possible target for the next one.
 
 `scip-java` upstream describes itself as a Java and Kotlin indexer. **Scala is
 not supported** by it, and Arbor has no Scala parser either — not even a
@@ -200,13 +206,25 @@ temporary space per translation unit.
 ### C# — [`scip-dotnet`]
 
 ```bash
-# Docker
-docker run -v "$PWD:/app" sourcegraph/scip-dotnet:latest scip-dotnet index
+# Docker — the published image is amd64 only; on Apple Silicon this fails
+# with "no matching manifest for linux/arm64/v8" without --platform.
+docker run --platform linux/amd64 -v "$PWD:/app" sourcegraph/scip-dotnet:latest scip-dotnet index
 
 # or .NET 8.0 installed locally
 dotnet tool install --global scip-dotnet
 scip-dotnet index
 ```
+
+Verified end to end via the Docker path, on a 20-document index: 652 nodes,
+1,660 edges. Two things worth knowing before trusting a C# graph:
+
+- `scip-dotnet` emits **no `is_implementation` relationships** — same footing
+  as `rust-analyzer` above. `arbor implementors` says so rather than reporting
+  an empty list, and virtual dispatch expansion contributes nothing on C#.
+- All 20 of 20 documents in that index carried **no enclosing ranges**, so
+  every caller attribution came from the nearest-preceding-definition
+  heuristic rather than the indexer — see "documents with no enclosing
+  ranges" below.
 
 ### Go — [`scip-go`]
 
@@ -243,6 +261,28 @@ vendor/bin/scip-php
 arbor scip index.scip --root .
 ```
 
+Composer installs the binary to the project's own `vendor/bin/scip-php`, not
+onto `PATH` — that is Composer's normal behaviour for a dev dependency, not a
+misconfiguration. `arbor scip --background` already knows to look there, so
+no `PATH` fiddling or symlink into `/usr/local/bin` is needed; it finds
+`vendor/bin/scip-php` in the project itself.
+
+Verified end to end on a 50-document repository: 707 nodes, 1,642 edges. Two
+things worth knowing before trusting a PHP graph:
+
+- `scip-php` writes the numeric `Language` enum value into `Document.language`
+  instead of the name the schema asks for (`19` rather than `PHP`). Arbor now
+  decodes that, so the ingest line and the style used to read PHP's symbols
+  (scope separator, `__construct` as the constructor) both come out right
+  regardless of the bug.
+- `scip-php` emits **no `is_implementation` relationships**, same footing as
+  `rust-analyzer` and `scip-dotnet` above. `arbor implementors` says so rather
+  than reporting an empty list, and virtual dispatch expansion contributes
+  nothing on a PHP graph.
+- All 50 of 50 documents in that index carried **no enclosing ranges**, same
+  positional-attribution caveat as C# and Dart — see "documents with no
+  enclosing ranges" below.
+
 ### Dart — [`scip-dart`]
 
 ```bash
@@ -251,14 +291,49 @@ dart pub global run scip_dart ./
 arbor scip index.scip --root .
 ```
 
+`dart pub global activate` installs the executable as `scip_dart` —
+**underscore**, not `scip-dart` — because that is the name scip-dart's own
+package declares. `arbor scip --background` looks for `scip_dart` first for
+exactly that reason; if you built a binary yourself and named it `scip-dart`
+(hyphen), that is still found as a fallback.
+
+`dart pub global activate` also installs into `~/.pub-cache/bin`, which is
+**not on `PATH`** — Pub's own installer prints a warning saying so. Before
+this was fixed, `arbor scip --background` on a Dart project reported "No
+matching SCIP indexer is installed" and printed `dart pub global activate
+scip_dart` back at you — the exact command you had just run. Arbor now looks
+in `~/.pub-cache/bin` directly (`also` in `crates/arbor-cli/src/indexers.rs`),
+so it works without touching `PATH`. The same shape applies to `dotnet tool
+install --global` → `~/.dotnet/tools`, above.
+
+Verified end to end on a 20-document project: 707 nodes, 2,161 edges. Took
+about 6 seconds after `dart pub get`. Two things worth knowing before trusting
+a Dart graph:
+
+- `scip-dart` emits **no `is_implementation` relationships** — same footing as
+  `rust-analyzer`, `scip-dotnet` and `scip-php` above. `arbor implementors`
+  says so rather than reporting an empty list, and virtual dispatch expansion
+  contributes nothing on a Dart graph.
+- All 20 of 20 documents in that index carried **no enclosing ranges**, so
+  every caller attribution came from the nearest-preceding-definition
+  heuristic rather than the indexer — see "documents with no enclosing
+  ranges" below.
+
 ## After ingesting, whatever the language
 
 `arbor scip` writes `.arbor/scip.json`, which makes the graph
 **SCIP-provenanced**. From then on no operation lets Tree-sitter overwrite it —
 `arbor index` refuses, reads serve the cache, and `arbor status` reports the
-source. That guard is language-agnostic, but the **automatic rebuild is not**:
-it invokes `scip-java`. On any other language, a stale graph prints a warning
-naming the indexer it cannot run, and refreshing is:
+source. That guard is language-agnostic, and so is the automatic rebuild: it
+runs `crate::indexers::detect` the same way `arbor scip --background` does,
+and re-runs whichever indexer the project's markers select — not just
+`scip-java`. The rebuild is **blocking** by design: a stale answer about code
+you just changed is worse than a slow one. Prefer not to wait? `Ctrl-C`, then
+`arbor scip --background`.
+
+If none of the detected indexers resolve to an installed binary, Arbor warns,
+names the indexer and its install command, and serves the cached graph rather
+than failing:
 
 ```bash
 <your indexer>            # regenerate index.scip
@@ -267,7 +342,10 @@ arbor scip index.scip --root .
 
 Set `ARBOR_NO_AUTO_REBUILD=1` to suppress the rebuild attempt entirely — worth
 doing in CI and in editor integrations, where a read command turning into a
-compile is not acceptable.
+compile is not acceptable. The one piece of this that is still genuinely
+`scip-java`-specific is its Gradle configuration-cache retry, and that is one
+optional `retry` field on that indexer's row in `crates/arbor-cli/src/indexers.rs`,
+not something the rebuild pipeline hard-codes.
 
 [SCIP]: https://github.com/scip-code/scip
 [`scip-java`]: https://github.com/scip-code/scip-java
@@ -483,9 +561,6 @@ remainder is indistinguishable from a decoding bug.
   editor does, so it produces an index from code that does not build.
 - **No incremental update.** There is no `--changed-only` equivalent: re-run the
   indexer and `arbor scip` again. `arbor watch` does not refresh a SCIP graph.
-- **Automatic refresh is scip-java only.** The staleness *check* covers every
-  supported language, but the rebuild it triggers invokes `scip-java`. On other
-  languages Arbor warns and serves the cached graph; refreshing is manual.
 - **Dispatch expansion depends on the indexer.** It is driven by SCIP
   `is_implementation` relationships, and not every indexer emits them —
   `rust-analyzer` emits none, so trait-impl reach is absent on Rust. This

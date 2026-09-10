@@ -1029,7 +1029,7 @@ impl McpServer {
                             .collect();
                         let count = items.len();
                         let note = match (count, hierarchy_available) {
-                            (0, false) => "This graph carries no type hierarchy, so this question cannot be answered from it. Build one with `arbor scip <index.scip>`; a Tree-sitter graph never has inheritance edges, and some SCIP indexers (rust-analyzer) emit none either.",
+                            (0, false) => "This graph carries no type hierarchy, so this question cannot be answered from it. Build one with `arbor scip <index.scip>`; a Tree-sitter graph never has inheritance edges, and some SCIP indexers (rust-analyzer, scip-dotnet) emit none either.",
                             (0, true) => "Nothing in this repository implements or extends the symbol. The graph does carry a hierarchy, so in-repo implementors are accounted for; external subclasses are not visible.",
                             _ => "Implementations do not call the symbol they implement, so these will not appear in get_callers.",
                         };
@@ -1136,7 +1136,7 @@ impl McpServer {
                             .collect();
                         let count = items.len();
                         let mut note = match (total, hierarchy_available) {
-                            (0, false) => "This graph carries no type hierarchy, so this question cannot be answered from it. Build one with `arbor scip <index.scip>`; a Tree-sitter graph never has inheritance edges, and some SCIP indexers (rust-analyzer) emit none either.".to_string(),
+                            (0, false) => "This graph carries no type hierarchy, so this question cannot be answered from it. Build one with `arbor scip <index.scip>`; a Tree-sitter graph never has inheritance edges, and some SCIP indexers (rust-analyzer, scip-dotnet) emit none either.".to_string(),
                             (0, true) => "This symbol implements or extends nothing in this repository. The graph does carry a hierarchy, so in-repo supertypes are accounted for; anything outside the repo is not visible.".to_string(),
                             _ => "These are the types this symbol derives from — its own implementors are the inverse relationship, from get_implementors.".to_string(),
                         };
