@@ -509,7 +509,8 @@ enum Commands {
         indexes: Vec<PathBuf>,
 
         /// Regenerate the index and re-ingest in a detached process, returning
-        /// a task handle. Invokes scip-java, which is a full compile.
+        /// a task handle. Detects which indexers this project needs and runs
+        /// them; for a compiler plugin such as scip-java that is a full build.
         #[arg(long)]
         background: bool,
 
