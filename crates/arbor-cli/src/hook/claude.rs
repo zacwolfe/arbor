@@ -19,6 +19,14 @@ const PERMISSIONS: &[&str] = &[
     "Bash(arbor file-graph *)",
     "Bash(arbor callers *)",
     "Bash(arbor callees *)",
+    // The relationship queries a call graph alone cannot answer. Read-only, and
+    // the reason an agent stops guessing from grep: implementations do not call
+    // the interface they implement, and a type use is not a call.
+    "Bash(arbor implementors *)",
+    "Bash(arbor subclasses *)",
+    "Bash(arbor supertypes *)",
+    "Bash(arbor uses-type *)",
+    "Bash(arbor references *)",
     "Bash(arbor map *)",
     "Bash(arbor path *)",
     "Bash(arbor inspect *)",
@@ -154,6 +162,10 @@ This project is indexed by Arbor. **You MUST use arbor for all codebase explorat
 | "Where is X defined?" | `arbor query "X" . --exclude-test` |
 | "What calls X?" | `arbor callers "X" .` |
 | "What does X call?" | `arbor callees "X" .` |
+| "Who implements this interface?" | `arbor implementors "X" .` |
+| "What does this class extend?" | `arbor supertypes "X" .` |
+| "Where is this type used?" | `arbor uses-type "X" .` |
+| "Who touches this field or constant?" | `arbor references "X" .` |
 | "What's in this file?" | `arbor file-graph "path" .` |
 | "How does A connect to B?" | `arbor path "A" "B" .` |
 | "What changed?" | `arbor diff .` |
@@ -182,6 +194,12 @@ arbor map . --exclude-test --focus-changed    # boost symbols in files you're ed
 - `arbor callers "symbol" .` — who calls this? (one hop upstream)
 - `arbor callees "symbol" .` — what does this call? (one hop downstream)
 - `arbor path "start" "end" .` — shortest path between two symbols in the call graph
+- `arbor implementors "symbol" .` — who implements or extends this? Ask BEFORE changing an interface method: its implementations do not call it, so `callers` will not find them
+- `arbor supertypes "symbol" .` — what does this type implement or extend?
+- `arbor uses-type "symbol" .` — where does this type appear (field, parameter, return, generic)? This is the question grep answers worst: `Order` also matches `OrderRequest`
+- `arbor references "symbol" .` — who touches this field, constant, or enum member? These are not calls, so a symbol with zero callers may still have dozens of references
+
+These four need a graph built from a compiler index. On a Tree-sitter graph they say so explicitly — an empty result is **never** evidence there are none unless the command says the relationship kind is available.
 
 ### Structural views
 - `arbor file-graph "src/path/File.java" .` — all symbols + internal edges within a file

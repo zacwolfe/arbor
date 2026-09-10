@@ -4,7 +4,10 @@ use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use arbor_graph::{changed_node_ids, compute_blast_radius, compute_centrality, HeuristicsMatcher};
+use arbor_graph::{
+    changed_node_ids, compute_blast_radius, compute_centrality, Direction, EdgeKind,
+    HeuristicsMatcher,
+};
 use arbor_server::{SharedGraph, SyncServerHandle};
 
 mod apps;
@@ -508,6 +511,49 @@ impl McpServer {
                     "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }
                 },
                 {
+                    "name": "get_supertypes",
+                    "description": "Returns the classes and interfaces a symbol implements or extends — the outgoing direction of the hierarchy get_implementors reads. Useful while reading unfamiliar code to see what a type derives from. Requires a graph built from a compiler index (SCIP); on a Tree-sitter graph the response says the hierarchy is unavailable rather than returning an empty list, so an empty result must never be read as 'this implements nothing' without checking hierarchyAvailable.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "symbol": { "type": "string", "description": "Name or ID of the class or interface" },
+                            "transitive": { "type": "boolean", "description": "Follow the hierarchy up to the root supertypes (default false)" },
+                            "limit": { "type": "integer", "description": "Maximum results to return; 0 means no limit (default: 50)", "default": 50 },
+                            "exclude_test": { "type": "boolean", "description": "Drop results whose file looks like a test/spec/fixture/mock (default: false)", "default": false }
+                        },
+                        "required": ["symbol"]
+                    },
+                    "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }
+                },
+                {
+                    "name": "get_type_usages",
+                    "description": "Returns where a type is used — as a field type, parameter, return type, or generic argument. Use INSTEAD of grep to find what breaks if you change a DTO or type: grep gets this worst, since 'Order' also matches 'OrderRequest', an import alias hides the real name, and a same-named class in another package is indistinguishable from the one you mean — a compiler index knows exactly which is which. Requires a graph built from a compiler index (SCIP); on a Tree-sitter graph the response says type-usage edges are unavailable rather than returning an empty list, so an empty result must never be read as 'nothing uses this type' without checking usesTypeAvailable.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "symbol": { "type": "string", "description": "Name or ID of the type" },
+                            "limit": { "type": "integer", "description": "Maximum results to return; 0 means no limit (default: 50)", "default": 50 },
+                            "exclude_test": { "type": "boolean", "description": "Drop results whose file looks like a test/spec/fixture/mock (default: false)", "default": false }
+                        },
+                        "required": ["symbol"]
+                    },
+                    "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }
+                },
+                {
+                    "name": "get_references",
+                    "description": "Returns symbols that reference a constant, enum member, or field — usages get_callers cannot see, because they are not calls; a symbol with zero callers may still have 27 references. It cannot distinguish a read from a write: SCIP's read/write-access roles are empty in every indexer measured, so 'who writes this field' is not answerable and must not be inferred. Requires a graph built from a compiler index (SCIP); on a Tree-sitter graph the response says reference edges are unavailable rather than returning an empty list, so an empty result must never be read as 'nothing references this' without checking referencesAvailable.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "symbol": { "type": "string", "description": "Name or ID of the constant, enum member, or field" },
+                            "limit": { "type": "integer", "description": "Maximum results to return; 0 means no limit (default: 50)", "default": 50 },
+                            "exclude_test": { "type": "boolean", "description": "Drop results whose file looks like a test/spec/fixture/mock (default: false)", "default": false }
+                        },
+                        "required": ["symbol"]
+                    },
+                    "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }
+                },
+                {
                     "name": "get_callees",
                     "description": "Returns the direct callees of a symbol (one hop downstream). Use to answer 'what does this function call?'",
                     "inputSchema": {
@@ -1004,6 +1050,309 @@ impl McpServer {
                             match count > 0 {
                                 true => json!({ "node_id": resolved_id }),
                                 false => json!({ "symbol": symbol }),
+                            },
+                        ))
+                    }
+                }
+            }
+            "get_supertypes" => {
+                const SUPERTYPE_KINDS: &[EdgeKind] = &[EdgeKind::Implements, EdgeKind::Extends];
+                let symbol = arguments
+                    .get("symbol")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let transitive = arguments
+                    .get("transitive")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let limit = arguments
+                    .get("limit")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(50) as usize;
+                let exclude_test = arguments
+                    .get("exclude_test")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let graph = self.graph.read().await;
+                let resolved = graph
+                    .get_index(symbol)
+                    .map(|idx| (symbol.to_string(), idx))
+                    .or_else(|| {
+                        graph
+                            .resolve_symbol(symbol)
+                            .and_then(|idx| graph.get(idx).map(|n| (n.id.clone(), idx)))
+                    });
+                match resolved {
+                    None => Ok(Self::err_envelope(
+                        "get_supertypes",
+                        &format!("Symbol '{}' not found", symbol),
+                    )),
+                    Some((resolved_id, idx)) => {
+                        let found: Vec<(&arbor_core::CodeNode, usize)> = match transitive {
+                            true => graph.related_transitive(
+                                idx,
+                                SUPERTYPE_KINDS,
+                                Direction::Outgoing,
+                                4,
+                            ),
+                            false => graph
+                                .related(idx, SUPERTYPE_KINDS, Direction::Outgoing)
+                                .into_iter()
+                                .map(|node| (node, 1))
+                                .collect(),
+                        };
+                        // Reported alongside the list, never inferred from its
+                        // length: this is the same inheritance edge set
+                        // get_implementors reads, so it carries the same
+                        // hierarchyAvailable flag for the same reason — a
+                        // Tree-sitter graph and a leaf class both produce an
+                        // empty list, and only the flag tells them apart.
+                        let hierarchy_available = graph.has_edges_of_kind(SUPERTYPE_KINDS);
+                        let filtered: Vec<(&arbor_core::CodeNode, usize)> = found
+                            .iter()
+                            .copied()
+                            .filter(|(n, _)| !exclude_test || !self.is_test_file(&n.file))
+                            .collect();
+                        let total = filtered.len();
+                        let truncated = limit != 0 && total > limit;
+                        let page: Vec<(&arbor_core::CodeNode, usize)> = if limit == 0 {
+                            filtered
+                        } else {
+                            filtered.into_iter().take(limit).collect()
+                        };
+                        let items: Vec<Value> = page
+                            .iter()
+                            .map(|(n, depth)| {
+                                json!({
+                                    "id": n.id,
+                                    "name": n.name,
+                                    "qualifiedName": n.qualified_name,
+                                    "kind": n.kind.to_string(),
+                                    "file": n.file,
+                                    "line": n.line_start,
+                                    "depth": depth
+                                })
+                            })
+                            .collect();
+                        let count = items.len();
+                        let mut note = match (total, hierarchy_available) {
+                            (0, false) => "This graph carries no type hierarchy, so this question cannot be answered from it. Build one with `arbor scip <index.scip>`; a Tree-sitter graph never has inheritance edges, and some SCIP indexers (rust-analyzer) emit none either.".to_string(),
+                            (0, true) => "This symbol implements or extends nothing in this repository. The graph does carry a hierarchy, so in-repo supertypes are accounted for; anything outside the repo is not visible.".to_string(),
+                            _ => "These are the types this symbol derives from — its own implementors are the inverse relationship, from get_implementors.".to_string(),
+                        };
+                        if truncated {
+                            note.push_str(&format!(
+                                " Showing {} of {} results; raise `limit` (0 = no limit) to see the rest.",
+                                count, total
+                            ));
+                        }
+                        Ok(Self::ok_envelope(
+                            "get_supertypes",
+                            json!({
+                                "symbol": symbol,
+                                "transitive": transitive,
+                                "hierarchyAvailable": hierarchy_available,
+                                "supertypes": items,
+                                "total": total,
+                                "hasMore": truncated,
+                                "note": note
+                            }),
+                            count,
+                            match count > 0 {
+                                true => "get_implementors",
+                                false => "get_callers",
+                            },
+                            match count > 0 {
+                                true => json!({ "node_id": resolved_id }),
+                                false => json!({ "symbol": symbol }),
+                            },
+                        ))
+                    }
+                }
+            }
+            "get_type_usages" => {
+                const USES_TYPE_KINDS: &[EdgeKind] = &[EdgeKind::UsesType];
+                let symbol = arguments
+                    .get("symbol")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let limit = arguments
+                    .get("limit")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(50) as usize;
+                let exclude_test = arguments
+                    .get("exclude_test")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let graph = self.graph.read().await;
+                let resolved = graph
+                    .get_index(symbol)
+                    .map(|idx| (symbol.to_string(), idx))
+                    .or_else(|| {
+                        graph
+                            .resolve_symbol(symbol)
+                            .and_then(|idx| graph.get(idx).map(|n| (n.id.clone(), idx)))
+                    });
+                match resolved {
+                    None => Ok(Self::err_envelope(
+                        "get_type_usages",
+                        &format!("Symbol '{}' not found", symbol),
+                    )),
+                    Some((resolved_id, idx)) => {
+                        let found = graph.related(idx, USES_TYPE_KINDS, Direction::Incoming);
+                        // Reported alongside the list, never inferred from its
+                        // length: Tree-sitter constructs no UsesType edges at
+                        // all, so an empty list from it means "unanswerable",
+                        // not "unused".
+                        let uses_type_available = graph.has_edges_of_kind(USES_TYPE_KINDS);
+                        let filtered: Vec<&arbor_core::CodeNode> = found
+                            .into_iter()
+                            .filter(|n| !exclude_test || !self.is_test_file(&n.file))
+                            .collect();
+                        let total = filtered.len();
+                        let truncated = limit != 0 && total > limit;
+                        let page: Vec<&arbor_core::CodeNode> = if limit == 0 {
+                            filtered
+                        } else {
+                            filtered.into_iter().take(limit).collect()
+                        };
+                        let items: Vec<Value> = page
+                            .iter()
+                            .map(|n| {
+                                json!({
+                                    "id": n.id,
+                                    "name": n.name,
+                                    "qualifiedName": n.qualified_name,
+                                    "kind": n.kind.to_string(),
+                                    "file": n.file,
+                                    "line": n.line_start
+                                })
+                            })
+                            .collect();
+                        let count = items.len();
+                        let mut note = match (total, uses_type_available) {
+                            (0, false) => "This graph carries no type-usage edges, so this question cannot be answered from it. Build one with `arbor scip <index.scip>`; a Tree-sitter graph never has UsesType edges.".to_string(),
+                            (0, true) => "Nothing in this repository uses this type as a field, parameter, return type, or generic argument. The graph does carry this edge kind, so in-repo usages are accounted for; anything outside the repo is not visible.".to_string(),
+                            _ => "These are type positions, not calls, so get_callers will not find them. This list is one entry per referencing symbol, not per occurrence: a method that uses this type five times still appears once.".to_string(),
+                        };
+                        if truncated {
+                            note.push_str(&format!(
+                                " Showing {} of {} results; raise `limit` (0 = no limit) to see the rest.",
+                                count, total
+                            ));
+                        }
+                        Ok(Self::ok_envelope(
+                            "get_type_usages",
+                            json!({
+                                "symbol": symbol,
+                                "usesTypeAvailable": uses_type_available,
+                                "usesType": items,
+                                "total": total,
+                                "hasMore": truncated,
+                                "note": note
+                            }),
+                            count,
+                            match count > 0 {
+                                true => "analyze_impact",
+                                false => "search_symbols",
+                            },
+                            match count > 0 {
+                                true => json!({ "node_id": resolved_id }),
+                                false => json!({ "query": symbol }),
+                            },
+                        ))
+                    }
+                }
+            }
+            "get_references" => {
+                const REFERENCE_KINDS: &[EdgeKind] = &[EdgeKind::References];
+                let symbol = arguments
+                    .get("symbol")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let limit = arguments
+                    .get("limit")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(50) as usize;
+                let exclude_test = arguments
+                    .get("exclude_test")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let graph = self.graph.read().await;
+                let resolved = graph
+                    .get_index(symbol)
+                    .map(|idx| (symbol.to_string(), idx))
+                    .or_else(|| {
+                        graph
+                            .resolve_symbol(symbol)
+                            .and_then(|idx| graph.get(idx).map(|n| (n.id.clone(), idx)))
+                    });
+                match resolved {
+                    None => Ok(Self::err_envelope(
+                        "get_references",
+                        &format!("Symbol '{}' not found", symbol),
+                    )),
+                    Some((resolved_id, idx)) => {
+                        let found = graph.related(idx, REFERENCE_KINDS, Direction::Incoming);
+                        // Reported alongside the list, never inferred from its
+                        // length: a field or constant can have zero callers
+                        // and dozens of references, and Tree-sitter emits
+                        // none of these edges at all.
+                        let references_available = graph.has_edges_of_kind(REFERENCE_KINDS);
+                        let filtered: Vec<&arbor_core::CodeNode> = found
+                            .into_iter()
+                            .filter(|n| !exclude_test || !self.is_test_file(&n.file))
+                            .collect();
+                        let total = filtered.len();
+                        let truncated = limit != 0 && total > limit;
+                        let page: Vec<&arbor_core::CodeNode> = if limit == 0 {
+                            filtered
+                        } else {
+                            filtered.into_iter().take(limit).collect()
+                        };
+                        let items: Vec<Value> = page
+                            .iter()
+                            .map(|n| {
+                                json!({
+                                    "id": n.id,
+                                    "name": n.name,
+                                    "qualifiedName": n.qualified_name,
+                                    "kind": n.kind.to_string(),
+                                    "file": n.file,
+                                    "line": n.line_start
+                                })
+                            })
+                            .collect();
+                        let count = items.len();
+                        let mut note = match (total, references_available) {
+                            (0, false) => "This graph carries no reference edges, so this question cannot be answered from it. Build one with `arbor scip <index.scip>`; a Tree-sitter graph never has References edges.".to_string(),
+                            (0, true) => "Nothing in this repository references this symbol. The graph does carry this edge kind, so in-repo references are accounted for; anything outside the repo is not visible.".to_string(),
+                            _ => "Read and write access are not distinguishable here: SCIP's access roles are empty in every indexer measured, so this list cannot say which references write the symbol. This list is also one entry per referencing symbol, not per occurrence: a method that references it five times still appears once.".to_string(),
+                        };
+                        if truncated {
+                            note.push_str(&format!(
+                                " Showing {} of {} results; raise `limit` (0 = no limit) to see the rest.",
+                                count, total
+                            ));
+                        }
+                        Ok(Self::ok_envelope(
+                            "get_references",
+                            json!({
+                                "symbol": symbol,
+                                "referencesAvailable": references_available,
+                                "references": items,
+                                "total": total,
+                                "hasMore": truncated,
+                                "note": note
+                            }),
+                            count,
+                            match count > 0 {
+                                true => "analyze_impact",
+                                false => "search_symbols",
+                            },
+                            match count > 0 {
+                                true => json!({ "node_id": resolved_id }),
+                                false => json!({ "query": symbol }),
                             },
                         ))
                     }

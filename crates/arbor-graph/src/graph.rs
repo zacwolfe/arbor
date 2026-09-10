@@ -8,11 +8,18 @@ use crate::search_index::SearchIndex;
 use arbor_core::CodeNode;
 use petgraph::stable_graph::{NodeIndex, StableDiGraph};
 use petgraph::visit::{EdgeRef, IntoEdgeReferences}; // For edge_references
+use petgraph::Direction;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// Unique identifier for a node in the graph.
 pub type NodeId = NodeIndex;
+
+/// The edge kinds that express a type hierarchy.
+///
+/// A single `EdgeKind` cannot say "inheritance" — a class can implement an
+/// interface or extend a base class — so every hierarchy query needs both.
+const INHERITANCE_KINDS: &[EdgeKind] = &[EdgeKind::Implements, EdgeKind::Extends];
 
 /// The code relationship graph.
 ///
@@ -324,17 +331,7 @@ impl ArborGraph {
     /// method's implementations do not call it, they *are* it, and folding the
     /// two together would make blast radius double-count the hierarchy.
     pub fn implementors(&self, index: NodeId) -> Vec<&CodeNode> {
-        self.graph
-            .neighbors_directed(index, petgraph::Direction::Incoming)
-            .filter_map(|idx| {
-                let edge_idx = self.graph.find_edge(idx, index)?;
-                let edge = self.graph.edge_weight(edge_idx)?;
-                match is_inheritance(edge.kind) {
-                    true => self.graph.node_weight(idx),
-                    false => None,
-                }
-            })
-            .collect()
+        self.related(index, INHERITANCE_KINDS, Direction::Incoming)
     }
 
     /// Types that implement or extend this one, at any depth.
@@ -351,6 +348,79 @@ impl ArborGraph {
         index: NodeId,
         max_depth: usize,
     ) -> Vec<(&CodeNode, usize)> {
+        self.related_transitive(index, INHERITANCE_KINDS, Direction::Incoming, max_depth)
+    }
+
+    /// Whether this graph contains any inheritance edge at all.
+    ///
+    /// The difference between "nothing implements this" and "this graph cannot
+    /// answer that question". Tree-sitter emits no inheritance edges, and neither
+    /// does every SCIP indexer — `rust-analyzer` emits no `is_implementation`
+    /// relationships — so an empty result has two very different meanings and a
+    /// caller must be able to tell them apart.
+    pub fn has_inheritance_edges(&self) -> bool {
+        self.has_edges_of_kind(INHERITANCE_KINDS)
+    }
+
+    /// Nodes connected to `index` by any edge whose kind is in `kinds`, in `direction`.
+    ///
+    /// Takes a slice rather than a single kind because some relationships are
+    /// more than one `EdgeKind` — inheritance is `Implements` *and* `Extends` —
+    /// and a single-kind signature would need a parallel "one of several kinds"
+    /// implementation immediately.
+    ///
+    /// Traverses with `edges_directed` rather than `neighbors_directed` +
+    /// `find_edge`, unlike the older `get_callers`/`get_callees` pattern.
+    /// `StableDiGraph::add_edge` allows parallel edges, and a SCIP graph really
+    /// does carry both e.g. a `Calls` and a `UsesType` edge between the same two
+    /// nodes; `find_edge` returns only one edge for a pair, so whichever kind it
+    /// does not return becomes invisible. `edges_directed` yields every edge, so
+    /// none of them are lost.
+    ///
+    /// Deduplicates the returned nodes by [`NodeId`], preserving first-seen
+    /// order — two parallel edges of the same kind must not yield the same node
+    /// twice.
+    pub fn related(
+        &self,
+        index: NodeId,
+        kinds: &[EdgeKind],
+        direction: Direction,
+    ) -> Vec<&CodeNode> {
+        let mut seen: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
+        let mut out = Vec::new();
+
+        for edge in self.graph.edges_directed(index, direction) {
+            if !kinds.contains(&edge.weight().kind) {
+                continue;
+            }
+            let neighbor = match direction {
+                Direction::Incoming => edge.source(),
+                Direction::Outgoing => edge.target(),
+            };
+            if !seen.insert(neighbor) {
+                continue;
+            }
+            if let Some(node) = self.graph.node_weight(neighbor) {
+                out.push(node);
+            }
+        }
+
+        out
+    }
+
+    /// Nodes connected to `index` by edges of `kinds`, at any depth in `direction`.
+    ///
+    /// Mirrors [`Self::implementors_transitive`] exactly: breadth-first, each
+    /// node paired with its distance starting at 1, `max_depth` bounds a
+    /// relationship graph that may be cyclic in a malformed index, and the
+    /// start node is marked seen up front so it never appears in the output.
+    pub fn related_transitive(
+        &self,
+        index: NodeId,
+        kinds: &[EdgeKind],
+        direction: Direction,
+        max_depth: usize,
+    ) -> Vec<(&CodeNode, usize)> {
         let mut seen: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
         seen.insert(index);
 
@@ -359,23 +429,21 @@ impl ArborGraph {
 
         for depth in 1..=max_depth {
             let mut next = Vec::new();
-            for current in frontier {
-                for idx in self
-                    .graph
-                    .neighbors_directed(current, petgraph::Direction::Incoming)
-                {
-                    let Some(edge_idx) = self.graph.find_edge(idx, current) else {
-                        continue;
-                    };
-                    let Some(edge) = self.graph.edge_weight(edge_idx) else {
-                        continue;
-                    };
-                    if !is_inheritance(edge.kind) || !seen.insert(idx) {
+            for current in &frontier {
+                for edge in self.graph.edges_directed(*current, direction) {
+                    if !kinds.contains(&edge.weight().kind) {
                         continue;
                     }
-                    if let Some(node) = self.graph.node_weight(idx) {
+                    let neighbor = match direction {
+                        Direction::Incoming => edge.source(),
+                        Direction::Outgoing => edge.target(),
+                    };
+                    if !seen.insert(neighbor) {
+                        continue;
+                    }
+                    if let Some(node) = self.graph.node_weight(neighbor) {
                         out.push((node, depth));
-                        next.push(idx);
+                        next.push(neighbor);
                     }
                 }
             }
@@ -388,17 +456,46 @@ impl ArborGraph {
         out
     }
 
-    /// Whether this graph contains any inheritance edge at all.
+    /// Groups a node's edges in `direction` by kind.
     ///
-    /// The difference between "nothing implements this" and "this graph cannot
-    /// answer that question". Tree-sitter emits no inheritance edges, and neither
-    /// does every SCIP indexer — `rust-analyzer` emits no `is_implementation`
-    /// relationships — so an empty result has two very different meanings and a
-    /// caller must be able to tell them apart.
-    pub fn has_inheritance_edges(&self) -> bool {
+    /// Kinds with no edges are omitted rather than inserted as empty vectors.
+    /// Nodes are deduplicated within each kind the same way [`Self::related`]
+    /// dedupes: parallel edges of the same kind must not repeat a node.
+    pub fn relationships_by_kind(
+        &self,
+        index: NodeId,
+        direction: Direction,
+    ) -> BTreeMap<EdgeKind, Vec<&CodeNode>> {
+        let mut by_kind: BTreeMap<EdgeKind, Vec<&CodeNode>> = BTreeMap::new();
+        let mut seen: std::collections::HashSet<(EdgeKind, NodeId)> =
+            std::collections::HashSet::new();
+
+        for edge in self.graph.edges_directed(index, direction) {
+            let kind = edge.weight().kind;
+            let neighbor = match direction {
+                Direction::Incoming => edge.source(),
+                Direction::Outgoing => edge.target(),
+            };
+            if !seen.insert((kind, neighbor)) {
+                continue;
+            }
+            if let Some(node) = self.graph.node_weight(neighbor) {
+                by_kind.entry(kind).or_default().push(node);
+            }
+        }
+
+        by_kind
+    }
+
+    /// Whether the graph contains any edge whose kind is in `kinds`.
+    ///
+    /// Same shape as [`Self::has_inheritance_edges`]: an empty result from
+    /// [`Self::related`] is ambiguous between "none exist" and "this indexer
+    /// never emits that kind", and callers need to tell the two apart.
+    pub fn has_edges_of_kind(&self, kinds: &[EdgeKind]) -> bool {
         (&self.graph)
             .edge_references()
-            .any(|edge| is_inheritance(edge.weight().kind))
+            .any(|edge| kinds.contains(&edge.weight().kind))
     }
 
     /// Gets nodes that this node calls.
@@ -1004,11 +1101,6 @@ fn qualified_name_ends_with(qualified_name: &str, suffix: &str) -> bool {
     head.ends_with('.') || head.ends_with("::") || head.ends_with('#') || head.ends_with('/')
 }
 
-/// Whether an edge expresses a type hierarchy.
-fn is_inheritance(kind: EdgeKind) -> bool {
-    matches!(kind, EdgeKind::Implements | EdgeKind::Extends)
-}
-
 /// Kinds a user means when they ask "who calls this".
 ///
 /// Used only to break a tie between candidates that are otherwise
@@ -1240,5 +1332,149 @@ mod inheritance_tests {
 
         let (with_hierarchy, _) = hierarchy();
         assert!(with_hierarchy.has_inheritance_edges());
+    }
+}
+
+#[cfg(test)]
+mod related_tests {
+    use super::*;
+    use arbor_core::NodeKind;
+
+    fn node(name: &str) -> CodeNode {
+        CodeNode::new(name, name, NodeKind::Class, "x.java").with_lines(1, 1)
+    }
+
+    #[test]
+    fn parallel_edges_of_different_kinds_are_both_visible() {
+        // The case `find_edge` gets wrong: two edges of different kinds
+        // between the same pair, where `find_edge` returns only one of them.
+        let mut graph = ArborGraph::new();
+        let a = graph.add_node(node("A"));
+        let b = graph.add_node(node("B"));
+        graph.add_edge(a, b, Edge::new(EdgeKind::Calls));
+        graph.add_edge(a, b, Edge::new(EdgeKind::UsesType));
+
+        let via_uses_type = graph.related(b, &[EdgeKind::UsesType], Direction::Incoming);
+        assert_eq!(via_uses_type.len(), 1);
+        assert_eq!(via_uses_type[0].name, "A");
+
+        let via_calls = graph.related(b, &[EdgeKind::Calls], Direction::Incoming);
+        assert_eq!(via_calls.len(), 1);
+        assert_eq!(via_calls[0].name, "A");
+    }
+
+    #[test]
+    fn parallel_edges_of_the_same_kind_dedupe_to_one_node() {
+        let mut graph = ArborGraph::new();
+        let a = graph.add_node(node("A"));
+        let b = graph.add_node(node("B"));
+        graph.add_edge(a, b, Edge::new(EdgeKind::References));
+        graph.add_edge(a, b, Edge::new(EdgeKind::References));
+
+        let found = graph.related(b, &[EdgeKind::References], Direction::Incoming);
+        assert_eq!(found.len(), 1, "two parallel edges must yield one node");
+    }
+
+    #[test]
+    fn direction_is_respected() {
+        let mut graph = ArborGraph::new();
+        let a = graph.add_node(node("A"));
+        let b = graph.add_node(node("B"));
+        graph.add_edge(a, b, Edge::new(EdgeKind::UsesType));
+
+        let incoming = graph.related(b, &[EdgeKind::UsesType], Direction::Incoming);
+        assert_eq!(incoming.len(), 1);
+        assert_eq!(incoming[0].name, "A");
+
+        assert!(graph
+            .related(b, &[EdgeKind::UsesType], Direction::Outgoing)
+            .is_empty());
+        assert!(graph
+            .related(a, &[EdgeKind::UsesType], Direction::Incoming)
+            .is_empty());
+    }
+
+    #[test]
+    fn multiple_kinds_return_the_union() {
+        let mut graph = ArborGraph::new();
+        let a = graph.add_node(node("A"));
+        let b = graph.add_node(node("B"));
+        let c = graph.add_node(node("C"));
+        graph.add_edge(a, b, Edge::new(EdgeKind::Calls));
+        graph.add_edge(c, b, Edge::new(EdgeKind::UsesType));
+
+        let mut names: Vec<&str> = graph
+            .related(
+                b,
+                &[EdgeKind::Calls, EdgeKind::UsesType],
+                Direction::Incoming,
+            )
+            .iter()
+            .map(|n| n.name.as_str())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["A", "C"]);
+    }
+
+    #[test]
+    fn relationships_by_kind_groups_and_omits_empty_kinds() {
+        let mut graph = ArborGraph::new();
+        let a = graph.add_node(node("A"));
+        let b = graph.add_node(node("B"));
+        let c = graph.add_node(node("C"));
+        graph.add_edge(a, b, Edge::new(EdgeKind::Calls));
+        graph.add_edge(a, b, Edge::new(EdgeKind::UsesType));
+        graph.add_edge(a, c, Edge::new(EdgeKind::UsesType));
+
+        let grouped = graph.relationships_by_kind(a, Direction::Outgoing);
+
+        assert_eq!(grouped.len(), 2, "only kinds with edges are present");
+        assert!(!grouped.contains_key(&EdgeKind::References));
+
+        let calls: Vec<&str> = grouped[&EdgeKind::Calls]
+            .iter()
+            .map(|n| n.name.as_str())
+            .collect();
+        assert_eq!(calls, vec!["B"]);
+
+        let mut uses_type: Vec<&str> = grouped[&EdgeKind::UsesType]
+            .iter()
+            .map(|n| n.name.as_str())
+            .collect();
+        uses_type.sort();
+        assert_eq!(uses_type, vec!["B", "C"]);
+    }
+
+    #[test]
+    fn has_edges_of_kind_is_true_for_present_and_false_for_absent() {
+        let mut graph = ArborGraph::new();
+        let a = graph.add_node(node("A"));
+        let b = graph.add_node(node("B"));
+        graph.add_edge(a, b, Edge::new(EdgeKind::UsesType));
+
+        assert!(graph.has_edges_of_kind(&[EdgeKind::UsesType]));
+        assert!(!graph.has_edges_of_kind(&[EdgeKind::References]));
+    }
+
+    #[test]
+    fn related_transitive_respects_max_depth_and_excludes_the_start_node() {
+        // A -UsesType-> B -UsesType-> C -UsesType-> D
+        let mut graph = ArborGraph::new();
+        let a = graph.add_node(node("A"));
+        let b = graph.add_node(node("B"));
+        let c = graph.add_node(node("C"));
+        let d = graph.add_node(node("D"));
+        graph.add_edge(a, b, Edge::new(EdgeKind::UsesType));
+        graph.add_edge(b, c, Edge::new(EdgeKind::UsesType));
+        graph.add_edge(c, d, Edge::new(EdgeKind::UsesType));
+
+        let found = graph.related_transitive(a, &[EdgeKind::UsesType], Direction::Outgoing, 2);
+        let names: Vec<&str> = found.iter().map(|(n, _)| n.name.as_str()).collect();
+
+        assert_eq!(names, vec!["B", "C"], "depth 2 stops before D");
+        assert!(
+            !names.contains(&"A"),
+            "the start node must never appear in its own results"
+        );
     }
 }

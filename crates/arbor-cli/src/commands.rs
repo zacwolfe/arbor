@@ -4625,6 +4625,454 @@ hierarchy: arbor scip <index.scip>"
     println!("  {}", reason.dimmed());
 }
 
+/// `"scip"`/`"tree-sitter"`, from whether `.arbor/scip.json` is present.
+///
+/// Shared by every relationship command's degradation reporting, so the two
+/// spellings never drift apart the way two independent `match` arms would.
+fn provenance_str(project_root: &Path) -> &'static str {
+    match arbor_graph::cache::is_scip_provenanced(project_root) {
+        true => "scip",
+        false => "tree-sitter",
+    }
+}
+
+/// Explains an empty relationship list without claiming there is nothing to
+/// find.
+///
+/// Every edge kind a compiler index alone produces — inheritance, type usage,
+/// bare references — has the same two failure modes: genuinely nothing found
+/// (the kind exists elsewhere in this graph) and the graph cannot construct
+/// this kind at all (Tree-sitter, or a SCIP indexer that happens not to emit
+/// it). Collapsing those into one "none found" is the mistake
+/// [`report_no_implementors`] exists to avoid, and it applies word-for-word to
+/// every kind here — hence one shared function rather than three near-copies.
+///
+/// `positive_absence_line` is the fully-formed sentence for "the kind exists,
+/// but this particular symbol has none" — it differs by direction (asking who
+/// implements X reads differently from asking what X implements), so it is
+/// supplied rather than assembled here. `capability` is the bare noun phrase
+/// naming what the graph would need ("type hierarchy", "type usage data",
+/// "reference data"). `scip_specific_reason`, when given, replaces the generic
+/// "the indexer emits none of this" sentence with one naming which indexers are
+/// known to skip it.
+fn report_relationship_absence(
+    symbol: &str,
+    positive_absence_line: &str,
+    capability: &str,
+    available: bool,
+    provenance: &str,
+    scip_specific_reason: Option<&str>,
+) {
+    if available {
+        println!("{}", positive_absence_line);
+        println!(
+            "  {}",
+            format!(
+                "This graph carries {capability}, so in-repo occurrences are \
+accounted for. External ones are still invisible."
+            )
+            .dimmed()
+        );
+        return;
+    }
+
+    println!(
+        "{} This graph has no {capability}, so this question cannot be answered from it.",
+        "⚠".yellow()
+    );
+
+    let reason = match (provenance, scip_specific_reason) {
+        ("scip", Some(extra)) => {
+            format!("{extra} That is not evidence that '{symbol}' has none.")
+        }
+        ("scip", None) => format!(
+            "The indexer that produced it emits no {capability}. That is not evidence \
+that '{symbol}' has none."
+        ),
+        _ => format!(
+            "It was built by Tree-sitter, which constructs no {capability} at all, so \
+'{symbol}' would look the same either way. A compiler index carries it: arbor scip <index.scip>"
+        ),
+    };
+    println!("  {}", reason.dimmed());
+}
+
+/// Filters by `--exclude-test`, then caps at `limit` (`0` = unlimited).
+///
+/// Returns the (possibly truncated) items to display and the total *after*
+/// filtering but *before* truncation — the number a truncation footer or a
+/// JSON `total` field needs so a consumer never mistakes a truncated list for
+/// the whole answer. Generic over the item shape so `uses_type`/`references`
+/// (`&CodeNode`) and `supertypes` (`(&CodeNode, usize)`) share one
+/// implementation instead of three near-copies.
+fn apply_limit<T>(
+    items: Vec<T>,
+    exclude_test: bool,
+    limit: usize,
+    file_of: impl Fn(&T) -> &str,
+) -> (Vec<T>, usize) {
+    let filtered: Vec<T> = match exclude_test {
+        true => items
+            .into_iter()
+            .filter(|item| !is_test_file(file_of(item)))
+            .collect(),
+        false => items,
+    };
+    let total = filtered.len();
+    let shown = match limit {
+        0 => filtered,
+        n => filtered.into_iter().take(n).collect(),
+    };
+    (shown, total)
+}
+
+/// The count in a result header — `"507"` when nothing was cut, `"507 total,
+/// showing 50"` when it was. The printed number must never disagree with the
+/// number of lines beneath it.
+fn count_label(total: usize, shown: usize) -> String {
+    match shown < total {
+        true => format!("{total} total, showing {shown}"),
+        false => total.to_string(),
+    }
+}
+
+/// Dimmed footer for a truncated list. Truncation must never be silent — an
+/// agent piping this into context needs to know both numbers and the escape
+/// hatch, not just a shorter list.
+fn print_truncation_note(shown: usize, total: usize, exclude_test: bool) {
+    if shown >= total {
+        return;
+    }
+    let hint = match exclude_test {
+        true => "Use --limit 0 for all.".to_string(),
+        false => "Use --limit 0 for all, or --exclude-test to drop test files.".to_string(),
+    };
+    println!(
+        "\n  {}",
+        format!("Showing {shown} of {total}. {hint}").dimmed()
+    );
+}
+
+/// Prints a `related`/`related_transitive` result the way `implementors` does.
+fn print_related_list(found: &[&arbor_core::CodeNode]) {
+    for node in found {
+        println!(
+            "  {} {} {}",
+            node.kind.to_string().yellow(),
+            node.qualified_name.cyan(),
+            format!("({}:{})", node.file, node.line_start).dimmed()
+        );
+    }
+}
+
+/// JSON items for a `related` result — the same shape `implementors --json`
+/// emits, minus `depth` for the non-transitive commands that never compute one.
+fn related_json_items(found: &[&arbor_core::CodeNode]) -> Vec<serde_json::Value> {
+    found
+        .iter()
+        .map(|n| {
+            serde_json::json!({
+                "id": n.id,
+                "name": n.name,
+                "qualifiedName": n.qualified_name,
+                "kind": n.kind.to_string(),
+                "file": n.file,
+                "line": n.line_start
+            })
+        })
+        .collect()
+}
+
+/// Shows where a type is used — as a field, parameter, return type, or generic
+/// argument.
+///
+/// Reads incoming `uses_type` edges, which only a compiler index carries.
+/// Grep answers this worst of everything Arbor reads a graph for: `Order`
+/// also matches `OrderRequest`, an import alias hides the real name, and a
+/// same-named class in another package is indistinguishable from source text
+/// alone. A compiler index resolved every use to the exact declaration.
+pub fn uses_type(
+    symbol: &str,
+    path: &Path,
+    json_output: bool,
+    limit: usize,
+    exclude_test: bool,
+) -> Result<()> {
+    let resolved_path = resolve_project_path(path)?;
+    let graph = load_or_index_graph(&resolved_path)?;
+
+    let (idx, ambiguous_with) = resolve_symbol_ranked(&graph, symbol)?;
+    if !json_output {
+        report_symbol_ambiguity(&graph, symbol, idx, &ambiguous_with);
+    }
+
+    const KINDS: &[arbor_graph::EdgeKind] = &[arbor_graph::EdgeKind::UsesType];
+    let found = graph.related(idx, KINDS, arbor_graph::Direction::Incoming);
+    let available = graph.has_edges_of_kind(KINDS);
+    let provenance = provenance_str(&resolved_path);
+
+    if json_output {
+        let (shown, total) = apply_limit(found, exclude_test, limit, |n| n.file.as_str());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "symbol": symbol,
+                "provenance": provenance,
+                "usesTypeAvailable": available,
+                "total": total,
+                "usesType": related_json_items(&shown)
+            }))?
+        );
+        return Ok(());
+    }
+
+    if found.is_empty() {
+        report_relationship_absence(
+            symbol,
+            &format!("Nothing is typed as '{}'.", symbol),
+            "type usage data",
+            available,
+            provenance,
+            None,
+        );
+        return Ok(());
+    }
+
+    let unfiltered_total = found.len();
+    let (shown, total) = apply_limit(found, exclude_test, limit, |n| n.file.as_str());
+
+    if shown.is_empty() {
+        println!(
+            "All {} uses of type '{}' are in test files; excluded by --exclude-test.",
+            unfiltered_total, symbol
+        );
+        return Ok(());
+    }
+
+    println!(
+        "Uses of type '{}' ({}):\n",
+        symbol,
+        count_label(total, shown.len())
+    );
+    print_related_list(&shown);
+    print_truncation_note(shown.len(), total, exclude_test);
+
+    Ok(())
+}
+
+/// Shows who references a constant, enum member, or field.
+///
+/// Reads incoming `references` edges, which only a compiler index carries —
+/// Tree-sitter builds none of it. This cannot distinguish a read from a
+/// write: SCIP's read/write access roles are empty in every indexer
+/// measured, so "who writes this field" is not a question this answers. What
+/// it does give is a real count where `arbor callers` reports zero, because a
+/// field or constant is never called.
+pub fn references(
+    symbol: &str,
+    path: &Path,
+    json_output: bool,
+    limit: usize,
+    exclude_test: bool,
+) -> Result<()> {
+    let resolved_path = resolve_project_path(path)?;
+    let graph = load_or_index_graph(&resolved_path)?;
+
+    let (idx, ambiguous_with) = resolve_symbol_ranked(&graph, symbol)?;
+    if !json_output {
+        report_symbol_ambiguity(&graph, symbol, idx, &ambiguous_with);
+    }
+
+    const KINDS: &[arbor_graph::EdgeKind] = &[arbor_graph::EdgeKind::References];
+    let found = graph.related(idx, KINDS, arbor_graph::Direction::Incoming);
+    let available = graph.has_edges_of_kind(KINDS);
+    let provenance = provenance_str(&resolved_path);
+
+    if json_output {
+        let (shown, total) = apply_limit(found, exclude_test, limit, |n| n.file.as_str());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "symbol": symbol,
+                "provenance": provenance,
+                "referencesAvailable": available,
+                "total": total,
+                "references": related_json_items(&shown)
+            }))?
+        );
+        return Ok(());
+    }
+
+    if found.is_empty() {
+        report_relationship_absence(
+            symbol,
+            &format!("Nothing references '{}'.", symbol),
+            "reference data",
+            available,
+            provenance,
+            None,
+        );
+        return Ok(());
+    }
+
+    let unfiltered_total = found.len();
+    let (shown, total) = apply_limit(found, exclude_test, limit, |n| n.file.as_str());
+
+    if shown.is_empty() {
+        println!(
+            "All {} references to '{}' are in test files; excluded by --exclude-test.",
+            unfiltered_total, symbol
+        );
+        return Ok(());
+    }
+
+    println!(
+        "References to '{}' ({}):\n",
+        symbol,
+        count_label(total, shown.len())
+    );
+    print_related_list(&shown);
+    println!(
+        "\n  {}",
+        "One line per referencing symbol — a method that touches it five times appears \
+once. Reads and writes are not distinguishable: SCIP's access-role data is empty in \
+every indexer measured."
+            .dimmed()
+    );
+    print_truncation_note(shown.len(), total, exclude_test);
+
+    Ok(())
+}
+
+/// Shows what a class implements or extends — the outgoing direction of the
+/// same edges [`implementors`] reads.
+///
+/// Same availability question as `implementors`: Tree-sitter cannot resolve
+/// `class Middle(Base)` into an edge, and some SCIP indexers (`rust-analyzer`)
+/// emit no implementation relationships either. `--transitive` walks up to the
+/// hierarchy root — interface → abstract base → concrete class is ordinary,
+/// and the answer usually wanted is every level, not just the direct parent.
+pub fn supertypes(
+    symbol: &str,
+    path: &Path,
+    transitive: bool,
+    json_output: bool,
+    limit: usize,
+    exclude_test: bool,
+) -> Result<()> {
+    let resolved_path = resolve_project_path(path)?;
+    let graph = load_or_index_graph(&resolved_path)?;
+
+    let (idx, ambiguous_with) = resolve_symbol_ranked(&graph, symbol)?;
+    if !json_output {
+        report_symbol_ambiguity(&graph, symbol, idx, &ambiguous_with);
+    }
+
+    const KINDS: &[arbor_graph::EdgeKind] = &[
+        arbor_graph::EdgeKind::Implements,
+        arbor_graph::EdgeKind::Extends,
+    ];
+    let found: Vec<(&arbor_core::CodeNode, usize)> = match transitive {
+        true => graph.related_transitive(
+            idx,
+            KINDS,
+            arbor_graph::Direction::Outgoing,
+            MAX_HIERARCHY_DEPTH,
+        ),
+        false => graph
+            .related(idx, KINDS, arbor_graph::Direction::Outgoing)
+            .into_iter()
+            .map(|node| (node, 1))
+            .collect(),
+    };
+
+    let hierarchy_available = graph.has_inheritance_edges();
+    let provenance = provenance_str(&resolved_path);
+
+    if json_output {
+        let (shown, total) = apply_limit(found, exclude_test, limit, |(n, _)| n.file.as_str());
+        let items: Vec<serde_json::Value> = shown
+            .iter()
+            .map(|(n, depth)| {
+                serde_json::json!({
+                    "id": n.id,
+                    "name": n.name,
+                    "qualifiedName": n.qualified_name,
+                    "kind": n.kind.to_string(),
+                    "file": n.file,
+                    "line": n.line_start,
+                    "depth": depth
+                })
+            })
+            .collect();
+
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "symbol": symbol,
+                "transitive": transitive,
+                "provenance": provenance,
+                "hierarchyAvailable": hierarchy_available,
+                "total": total,
+                "supertypes": items
+            }))?
+        );
+        return Ok(());
+    }
+
+    if found.is_empty() {
+        report_relationship_absence(
+            symbol,
+            &format!("'{}' implements or extends nothing.", symbol),
+            "type hierarchy",
+            hierarchy_available,
+            provenance,
+            Some(
+                "Some indexers emit no implementation relationships — rust-analyzer is \
+one such.",
+            ),
+        );
+        return Ok(());
+    }
+
+    let unfiltered_total = found.len();
+    let (shown, total) = apply_limit(found, exclude_test, limit, |(n, _)| n.file.as_str());
+
+    if shown.is_empty() {
+        println!(
+            "All {} supertypes of '{}' are in test files; excluded by --exclude-test.",
+            unfiltered_total, symbol
+        );
+        return Ok(());
+    }
+
+    println!(
+        "Supertypes of '{}' ({}):\n",
+        symbol,
+        count_label(total, shown.len())
+    );
+    for (node, depth) in &shown {
+        let indent = "  ".repeat(*depth);
+        println!(
+            "{}{} {} {}",
+            indent,
+            node.kind.to_string().yellow(),
+            node.qualified_name.cyan(),
+            format!("({}:{})", node.file, node.line_start).dimmed()
+        );
+    }
+
+    if !transitive {
+        println!(
+            "\n  {}",
+            "Only direct supertypes. Use --transitive to walk to the hierarchy root.".dimmed()
+        );
+    }
+    print_truncation_note(shown.len(), total, exclude_test);
+
+    Ok(())
+}
+
 pub fn callers(symbol: &str, path: &Path, json_output: bool) -> Result<()> {
     let resolved_path = resolve_project_path(path)?;
     let graph = load_or_index_graph(&resolved_path)?;
@@ -4872,6 +5320,9 @@ pub fn inspect(symbol: &str, path: &Path, json_output: bool) -> Result<()> {
         "internal"
     };
 
+    let outgoing = graph.relationships_by_kind(idx, arbor_graph::Direction::Outgoing);
+    let incoming = graph.relationships_by_kind(idx, arbor_graph::Direction::Incoming);
+
     if json_output {
         println!(
             "{}",
@@ -4887,7 +5338,11 @@ pub fn inspect(symbol: &str, path: &Path, json_output: bool) -> Result<()> {
                 "role": role,
                 "caller_count": callers.len(),
                 "callee_count": callees.len(),
-                "is_entry_point": is_entry
+                "is_entry_point": is_entry,
+                "relationships": {
+                    "outgoing": relationships_by_kind_json(&outgoing),
+                    "incoming": relationships_by_kind_json(&incoming)
+                }
             }))?
         );
     } else {
@@ -4907,9 +5362,76 @@ pub fn inspect(symbol: &str, path: &Path, json_output: bool) -> Result<()> {
         println!("  {}:     {:.4}", "Rank".bold(), centrality);
         println!("  {}:  {}", "Callers".bold(), callers.len());
         println!("  {}:  {}", "Callees".bold(), callees.len());
+        print_relationships_section("outgoing", &outgoing);
+        print_relationships_section("incoming", &incoming);
     }
 
     Ok(())
+}
+
+/// A node's `name`, falling back to `qualified_name` when the name is blank.
+///
+/// The simplest disambiguation that is still an improvement: a full
+/// uniqueness check per list would need to know how the caller intends to
+/// re-resolve the name, which `inspect`'s relationship summary does not.
+fn relationship_node_label(node: &arbor_core::CodeNode) -> &str {
+    if node.name.is_empty() {
+        &node.qualified_name
+    } else {
+        &node.name
+    }
+}
+
+/// Prints one direction's relationship kinds under `inspect`, omitting the
+/// heading entirely when that direction has no relationships at all — an
+/// empty "Relationships (incoming):" with nothing under it says less than
+/// silence.
+fn print_relationships_section(
+    direction_label: &str,
+    by_kind: &std::collections::BTreeMap<arbor_graph::EdgeKind, Vec<&arbor_core::CodeNode>>,
+) {
+    if by_kind.is_empty() {
+        return;
+    }
+
+    println!("  {} ({}):", "Relationships".bold(), direction_label);
+    for (kind, nodes) in by_kind {
+        let shown: Vec<&str> = nodes
+            .iter()
+            .take(5)
+            .map(|n| relationship_node_label(n))
+            .collect();
+        let mut summary = shown.join(", ");
+        if nodes.len() > 5 {
+            summary.push_str(&format!(", … and {} more", nodes.len() - 5));
+        }
+        println!(
+            "    {:<12} {:>3}  {} {}",
+            kind.to_string(),
+            nodes.len(),
+            "→".dimmed(),
+            summary
+        );
+    }
+}
+
+/// JSON form of one direction's relationships for `inspect --json`: each kind
+/// keyed to its count and node list, so a consumer never has to re-derive the
+/// count from `nodes.len()` after pagination or truncation is added later.
+fn relationships_by_kind_json(
+    by_kind: &std::collections::BTreeMap<arbor_graph::EdgeKind, Vec<&arbor_core::CodeNode>>,
+) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    for (kind, nodes) in by_kind {
+        map.insert(
+            kind.to_string(),
+            serde_json::json!({
+                "count": nodes.len(),
+                "nodes": related_json_items(nodes)
+            }),
+        );
+    }
+    serde_json::Value::Object(map)
 }
 
 pub fn find_path_cmd(start: &str, end: &str, path: &Path, json_output: bool) -> Result<()> {

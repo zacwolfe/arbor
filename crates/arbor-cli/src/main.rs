@@ -369,6 +369,95 @@ enum Commands {
         json: bool,
     },
 
+    /// Show where a type is used — as a field, parameter, return type, or
+    /// generic argument
+    ///
+    /// Reads `uses_type` edges, which only a compiler index carries. Grep
+    /// answers this question worst of all: `Order` also matches
+    /// `OrderRequest`, an import alias hides the real name, and a same-named
+    /// class in another package is indistinguishable from source text alone.
+    /// On a graph with no such edges Arbor says so explicitly rather than
+    /// reporting an empty result.
+    UsesType {
+        /// The type to look up
+        symbol: String,
+
+        /// Path to analyze (defaults to current directory)
+        #[arg(default_value = ".")]
+        path: PathBuf,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+
+        /// Maximum results to return (0 = no limit)
+        #[arg(short, long, default_value = "50")]
+        limit: usize,
+
+        /// Exclude test/spec/fixture/mock files from results
+        #[arg(long)]
+        exclude_test: bool,
+    },
+
+    /// Show who references a constant, enum member, or field
+    ///
+    /// Reads `references` edges, which only a compiler index carries. This
+    /// cannot distinguish a read from a write — SCIP's read/write access
+    /// roles are empty in every indexer measured — but it gives a real count
+    /// where `arbor callers` reports zero, because a field or constant is
+    /// never called.
+    References {
+        /// The symbol to look up
+        symbol: String,
+
+        /// Path to analyze (defaults to current directory)
+        #[arg(default_value = ".")]
+        path: PathBuf,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+
+        /// Maximum results to return (0 = no limit)
+        #[arg(short, long, default_value = "50")]
+        limit: usize,
+
+        /// Exclude test/spec/fixture/mock files from results
+        #[arg(long)]
+        exclude_test: bool,
+    },
+
+    /// Show what a class implements or extends (the reverse of `implementors`)
+    ///
+    /// Reads the same type hierarchy `implementors` does, in the outgoing
+    /// direction, so it has the same availability question: Tree-sitter
+    /// carries no hierarchy at all, and some SCIP indexers emit no
+    /// implementation relationships either.
+    Supertypes {
+        /// The class or interface to look up
+        symbol: String,
+
+        /// Path to analyze (defaults to current directory)
+        #[arg(default_value = ".")]
+        path: PathBuf,
+
+        /// Follow the hierarchy up to the root, not just the direct supertypes
+        #[arg(long)]
+        transitive: bool,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+
+        /// Maximum results to return (0 = no limit)
+        #[arg(short, long, default_value = "50")]
+        limit: usize,
+
+        /// Exclude test/spec/fixture/mock files from results
+        #[arg(long)]
+        exclude_test: bool,
+    },
+
     /// Show direct callees of a symbol (what does this call?)
     Callees {
         /// The symbol to look up
@@ -693,6 +782,28 @@ async fn main() {
             transitive,
             json,
         } => commands::implementors(&symbol, &path, transitive, json),
+        Commands::UsesType {
+            symbol,
+            path,
+            json,
+            limit,
+            exclude_test,
+        } => commands::uses_type(&symbol, &path, json, limit, exclude_test),
+        Commands::References {
+            symbol,
+            path,
+            json,
+            limit,
+            exclude_test,
+        } => commands::references(&symbol, &path, json, limit, exclude_test),
+        Commands::Supertypes {
+            symbol,
+            path,
+            transitive,
+            json,
+            limit,
+            exclude_test,
+        } => commands::supertypes(&symbol, &path, transitive, json, limit, exclude_test),
         Commands::EntryPoints { path, json } => commands::entry_points(&path, json),
         Commands::FileGraph { file, path, json } => commands::file_graph(&file, &path, json),
         Commands::Inspect { symbol, path, json } => commands::inspect(&symbol, &path, json),

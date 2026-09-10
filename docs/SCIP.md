@@ -276,14 +276,42 @@ compile is not acceptable.
 
 ## Querying it
 
-Nothing changes at the query layer. Same commands, same output shape — the edges
-are just exact:
+The commands you already use keep their shape — the edges are just exact:
 
 ```bash
 arbor callees "pay" .
 arbor callers "charge" .
 arbor map . --exclude-test
 ```
+
+Four more commands only work on a graph like this one, because a call graph
+alone does not contain the answers:
+
+```bash
+arbor implementors "Gateway.charge" .   # who implements or extends it
+arbor supertypes "StripeGateway" .      # what it implements or extends
+arbor uses-type "OrderRequest" .        # field, parameter, return, generic
+arbor references "MAX_RETRIES" .        # what touches a field or constant
+```
+
+`arbor inspect` groups a symbol's edges by kind in both directions, which is
+the cheapest way to see what a node actually participates in — a Spring
+`@Component` with zero callers and zero callees can still have seven
+supertypes.
+
+Two things worth knowing about the counts:
+
+- **They count symbols, not textual occurrences.** A method that reads a field
+  five times is one entry. On a real `scip-java` graph, 291 `references` edges
+  into one field come from 126 distinct methods, and 126 is what is reported.
+- **Reads and writes are not distinguishable.** SCIP's `ReadAccess`/`WriteAccess`
+  roles are empty in every indexer measured, so "who *writes* this field" is not
+  a question any of this answers.
+
+On a Tree-sitter graph these four say the graph cannot answer, name what
+produced it, and exit 0. They never report an empty list as an absence — an
+interface with four implementations reported as "no implementors" is how someone
+deletes it.
 
 ## scip-java specifics
 
@@ -337,7 +365,9 @@ indexes covering different files simply coexist.
 | `foo()` | resolved by name, confidence-weighted | exact |
 | `obj.method()` | **no edge** | exact |
 | Overloads | collapsed into one node | distinct nodes |
-| Interface → impl | not represented | `Implements` edges |
+| Interface → impl | not represented | `Implements` edges (`implementors`, `supertypes`) |
+| Type in a signature | not represented | `UsesType` edges (`uses-type`) |
+| Field or constant use | not represented | `References` edges (`references`) |
 | Virtual dispatch | not represented | synthesised call edges |
 | Needs a build | no | yes |
 

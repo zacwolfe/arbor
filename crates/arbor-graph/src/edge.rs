@@ -7,7 +7,11 @@
 use serde::{Deserialize, Serialize};
 
 /// The type of relationship between two code entities.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+///
+/// `PartialOrd`/`Ord` key this into a `BTreeMap` (see
+/// `ArborGraph::relationships_by_kind`); the ordering is simply declaration
+/// order below, which is deterministic and doubles as the display order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EdgeKind {
     /// Function A calls function B.

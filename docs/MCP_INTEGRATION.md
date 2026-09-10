@@ -239,6 +239,9 @@ Errors return `{ "ok": false, "error": "..." }`.
 | `get_callers` | Returns all nodes that call a given symbol |
 | `get_callees` | Returns all nodes called by a given symbol |
 | `get_implementors` | Returns the types that implement or extend a symbol. Requires a SCIP-built graph; the response carries `hierarchyAvailable` so an empty list is never mistaken for "nothing implements this" |
+| `get_supertypes` | Returns what a symbol implements or extends — the outgoing direction of the same hierarchy, carrying the same `hierarchyAvailable` flag |
+| `get_type_usages` | Returns where a type appears: field, parameter, return type, generic argument. The query grep answers worst — `Order` also matches `OrderRequest`. Carries `usesTypeAvailable` |
+| `get_references` | Returns what touches a field, constant, or enum member — usages `get_callers` cannot see, because they are not calls. Cannot distinguish read from write. Carries `referencesAvailable` |
 | `search_symbols` | Fuzzy search across all symbol names |
 | `get_file_graph` | Returns all nodes and intra-file edges for a given file path |
 | `get_node_detail` | Returns full detail for a node by ID or name |

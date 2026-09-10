@@ -61,6 +61,9 @@ pub use heuristics::{
 };
 pub use impact::{AffectedNode, ImpactAnalysis, ImpactDirection, ImpactSeverity};
 pub use lexicon::{stem, tokenize_identifier, Lexicon};
+// Re-exported so downstream crates (e.g. `arbor-mcp`) can name the traversal
+// direction without taking a direct `petgraph` dependency.
+pub use petgraph::Direction;
 pub use query::{DependentInfo, ImpactResult, NodeInfo, QueryResult};
 pub use ranking::{compute_centrality, compute_centrality_warm, CentralityScores};
 pub use scip_task::{ScipTask, ScipTaskStatus};

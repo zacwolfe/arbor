@@ -17,6 +17,11 @@ const GATEWAY_TYPE: &str = "semanticdb maven . . com/example/Gateway#";
 const GATEWAY_CHARGE: &str = "semanticdb maven . . com/example/Gateway#charge().";
 const STRIPE_CHARGE: &str = "semanticdb maven . . com/example/StripeGateway#charge().";
 const CHECKOUT_PAY: &str = "semanticdb maven . . com/example/Checkout#pay().";
+const CHECKOUT_TYPE: &str = "semanticdb maven . . com/example/Checkout#";
+const CHECKOUT_GATEWAY_FIELD: &str = "semanticdb maven . . com/example/Checkout#gateway.";
+const CHECKOUT_TEST_TYPE: &str = "semanticdb maven . . com/example/CheckoutTest#";
+const CHECKOUT_TEST_GATEWAY_FIELD: &str = "semanticdb maven . . com/example/CheckoutTest#gateway.";
+const CHECKOUT_TEST_CHARGE: &str = "semanticdb maven . . com/example/CheckoutTest#testCharge().";
 
 /// Runs arbor with auto-rebuild disabled.
 ///
@@ -168,6 +173,117 @@ fn setup_java_project() -> TempDir {
                 // `gateway.charge()` — the call Tree-sitter has to drop because
                 // it cannot type the receiver.
                 reference(GATEWAY_CHARGE, 5),
+            ],
+            vec![],
+        ),
+    ];
+
+    scip::write_message_to_file(dir.join("index.scip"), index).expect("write index.scip");
+
+    temp
+}
+
+/// The same three-file Java project as [`setup_java_project`], with the
+/// `references`/`uses_type` edges that command needs and the plain
+/// `Calls`/`Implements` fixture does not exercise.
+///
+/// `Checkout.java`'s existing text already has the shapes these edges need:
+/// `private Gateway gateway;` (line 3, 0-indexed) is a field typed by an
+/// interface, and `gateway.charge()` (line 5) is a field access next to the
+/// method call the original fixture already covers. Adding the Checkout type
+/// and field as definitions, plus occurrences naming what they refer to, is
+/// enough for `reference_edge_kind` (`arbor-scip/src/ingest.rs`) to type them:
+/// a reference whose target is a class/interface becomes `UsesType`, and a
+/// reference whose target is a plain field becomes `References`.
+///
+/// Also adds `src/test/java/com/example/CheckoutTest.java`, a test-file
+/// source with its own `gateway` field typed as `Gateway` (a second incoming
+/// `uses_type` edge on `Gateway`, distinct from `Checkout.gateway`) and its
+/// own `testCharge()` method referencing that field (a `references` edge that
+/// targets a symbol nothing else in this fixture touches, so it cannot change
+/// the `Checkout.gateway` incoming-reference count another test asserts on).
+/// This is what exercises `--exclude-test` for `uses-type`/`references`.
+fn setup_java_project_with_relationships() -> TempDir {
+    let temp = TempDir::new().expect("create temp dir");
+    let dir = temp.path();
+
+    fs::write(dir.join("pom.xml"), "<project/>\n").expect("write pom.xml");
+
+    let sources = dir.join("src/main/java/com/example");
+    fs::create_dir_all(&sources).expect("create source dirs");
+    fs::write(
+        sources.join("Gateway.java"),
+        "package com.example;\n\npublic interface Gateway {\n    void charge();\n}\n",
+    )
+    .expect("write Gateway.java");
+    fs::write(
+        sources.join("StripeGateway.java"),
+        "package com.example;\n\npublic class StripeGateway implements Gateway {\n    public void charge() {}\n}\n",
+    )
+    .expect("write StripeGateway.java");
+    fs::write(
+        sources.join("Checkout.java"),
+        "package com.example;\n\npublic class Checkout {\n    private Gateway gateway;\n    public void pay() {\n        gateway.charge();\n    }\n}\n",
+    )
+    .expect("write Checkout.java");
+
+    let test_sources = dir.join("src/test/java/com/example");
+    fs::create_dir_all(&test_sources).expect("create test source dirs");
+    fs::write(
+        test_sources.join("CheckoutTest.java"),
+        "package com.example;\n\npublic class CheckoutTest {\n    private Gateway gateway;\n    public void testCharge() {\n        gateway.charge();\n    }\n}\n",
+    )
+    .expect("write CheckoutTest.java");
+
+    let mut index = Index::new();
+    index.documents = vec![
+        document(
+            "src/main/java/com/example/Gateway.java",
+            vec![
+                definition(GATEWAY_TYPE, 2, 4),
+                definition(GATEWAY_CHARGE, 3, 3),
+            ],
+            vec![],
+        ),
+        document(
+            "src/main/java/com/example/StripeGateway.java",
+            vec![definition(STRIPE_CHARGE, 3, 3)],
+            vec![implements(STRIPE_CHARGE, GATEWAY_CHARGE)],
+        ),
+        document(
+            "src/main/java/com/example/Checkout.java",
+            vec![
+                definition(CHECKOUT_TYPE, 2, 7),
+                definition(CHECKOUT_GATEWAY_FIELD, 3, 3),
+                definition(CHECKOUT_PAY, 4, 6),
+                // `private Gateway gateway;` — the field's declared type. The
+                // innermost enclosing definition at line 3 is the field
+                // itself, so this becomes `Checkout.gateway --uses_type--> Gateway`.
+                reference(GATEWAY_TYPE, 3),
+                // `gateway.charge()` — the call Tree-sitter has to drop
+                // because it cannot type the receiver (unchanged from the
+                // plain fixture).
+                reference(GATEWAY_CHARGE, 5),
+                // The same line's `gateway` field access. The enclosing
+                // definition at line 5 is `pay()`, so this becomes
+                // `Checkout.pay --references--> Checkout.gateway`.
+                reference(CHECKOUT_GATEWAY_FIELD, 5),
+            ],
+            vec![],
+        ),
+        document(
+            "src/test/java/com/example/CheckoutTest.java",
+            vec![
+                definition(CHECKOUT_TEST_TYPE, 2, 6),
+                definition(CHECKOUT_TEST_GATEWAY_FIELD, 3, 3),
+                definition(CHECKOUT_TEST_CHARGE, 4, 6),
+                // A second field typed as `Gateway`, so `uses-type Gateway`
+                // has a test-file result to filter with `--exclude-test`.
+                reference(GATEWAY_TYPE, 3),
+                // References its own field, not `Checkout.gateway` — this
+                // must not perturb the incoming-reference count another test
+                // asserts on for `Checkout.gateway`.
+                reference(CHECKOUT_TEST_GATEWAY_FIELD, 5),
             ],
             vec![],
         ),
@@ -1152,4 +1268,260 @@ fn setup_still_indexes_a_plain_project() {
     let stdout = run_arbor_stdout(dir, &["setup", "."]);
     assert!(stdout.contains("Indexed"), "got: {stdout}");
     assert!(!dir.join(".arbor/scip.json").exists());
+}
+
+/// `Order` also matches `OrderRequest` under grep; a compiler index does not
+/// have that problem. `Checkout.gateway`'s declared type is `Gateway`, so
+/// `uses-type Gateway` must find it.
+#[test]
+fn uses_type_finds_the_checkout_field() {
+    let temp = setup_java_project_with_relationships();
+    let dir = temp.path();
+
+    run_arbor_stdout(dir, &["scip", "index.scip", "--root", "."]);
+
+    let stdout = run_arbor_stdout(dir, &["uses-type", "Gateway", "."]);
+    assert!(
+        stdout.contains("com.example.Checkout.gateway"),
+        "expected the field typed as Gateway, got: {stdout}"
+    );
+}
+
+/// `arbor callers` reports zero for a field — it is never called — but the
+/// field is still touched by `Checkout.pay`, which `references` can see.
+#[test]
+fn references_finds_the_field_access() {
+    let temp = setup_java_project_with_relationships();
+    let dir = temp.path();
+
+    run_arbor_stdout(dir, &["scip", "index.scip", "--root", "."]);
+
+    let stdout = run_arbor_stdout(dir, &["references", "Checkout.gateway", "."]);
+    assert!(
+        stdout.contains("com.example.Checkout.pay"),
+        "expected pay() to show up as a reference to the field, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("read") || stdout.contains("write") || stdout.contains("access-role"),
+        "must note that read vs. write is not knowable, got: {stdout}"
+    );
+}
+
+/// The outgoing direction of the fixture's existing `implements` relationship:
+/// `StripeGateway.charge` implements `Gateway.charge`.
+#[test]
+fn supertypes_finds_the_interface_method() {
+    let temp = setup_java_project();
+    let dir = temp.path();
+
+    run_arbor_stdout(dir, &["scip", "index.scip", "--root", "."]);
+
+    let stdout = run_arbor_stdout(dir, &["supertypes", "StripeGateway.charge", "."]);
+    assert!(
+        stdout.contains("com.example.Gateway.charge"),
+        "expected the interface method it implements, got: {stdout}"
+    );
+}
+
+/// The hard requirement for every one of these commands, same as
+/// `implementors`: a Tree-sitter graph must say it cannot answer, never that
+/// there is nothing to find.
+#[test]
+fn uses_type_on_a_tree_sitter_graph_says_it_cannot_answer() {
+    let temp = setup_java_project_with_relationships();
+    let dir = temp.path();
+
+    run_arbor_stdout(dir, &["index", "."]);
+
+    let output = run_arbor(dir, &["uses-type", "Gateway", "."]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        output.status.success(),
+        "a missing capability is not a user error: {stdout}"
+    );
+    assert!(
+        stdout.contains("cannot be answered"),
+        "must say the graph cannot answer: {stdout}"
+    );
+    assert!(stdout.contains("Tree-sitter"), "got: {stdout}");
+    assert!(stdout.contains("arbor scip"), "got: {stdout}");
+    assert!(
+        !stdout.contains("Nothing is typed as"),
+        "must not report absence as fact: {stdout}"
+    );
+}
+
+#[test]
+fn references_on_a_tree_sitter_graph_says_it_cannot_answer() {
+    let temp = setup_java_project_with_relationships();
+    let dir = temp.path();
+
+    run_arbor_stdout(dir, &["index", "."]);
+
+    let output = run_arbor(dir, &["references", "Checkout.gateway", "."]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        output.status.success(),
+        "a missing capability is not a user error: {stdout}"
+    );
+    assert!(
+        stdout.contains("cannot be answered"),
+        "must say the graph cannot answer: {stdout}"
+    );
+    assert!(stdout.contains("Tree-sitter"), "got: {stdout}");
+    assert!(stdout.contains("arbor scip"), "got: {stdout}");
+    assert!(
+        !stdout.contains("Nothing references"),
+        "must not report absence as fact: {stdout}"
+    );
+}
+
+#[test]
+fn supertypes_on_a_tree_sitter_graph_says_it_cannot_answer() {
+    let temp = setup_java_project();
+    let dir = temp.path();
+
+    run_arbor_stdout(dir, &["index", "."]);
+
+    let output = run_arbor(dir, &["supertypes", "StripeGateway.charge", "."]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        output.status.success(),
+        "a missing capability is not a user error: {stdout}"
+    );
+    assert!(
+        stdout.contains("no type hierarchy"),
+        "must say the graph cannot answer: {stdout}"
+    );
+    assert!(stdout.contains("Tree-sitter"), "got: {stdout}");
+    assert!(stdout.contains("arbor scip"), "got: {stdout}");
+    assert!(
+        !stdout.contains("implements or extends nothing"),
+        "must not report absence as fact: {stdout}"
+    );
+}
+
+/// The JSON form has to carry the same distinction as the human output, or a
+/// tool consuming it re-derives the mistake straight from an empty list.
+#[test]
+fn uses_type_json_reports_whether_the_answer_is_knowable() {
+    let temp = setup_java_project_with_relationships();
+    let dir = temp.path();
+
+    run_arbor_stdout(dir, &["index", "."]);
+    let stdout = run_arbor_stdout(dir, &["uses-type", "Gateway", ".", "--json"]);
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+
+    assert_eq!(value["usesTypeAvailable"], false);
+    assert_eq!(value["provenance"], "tree-sitter");
+    assert_eq!(value["usesType"].as_array().unwrap().len(), 0);
+}
+
+/// `inspect --json` on a SCIP graph must carry the relationship data at all —
+/// the whole point of the new section.
+#[test]
+fn inspect_json_carries_relationships_on_a_scip_graph() {
+    let temp = setup_java_project_with_relationships();
+    let dir = temp.path();
+
+    run_arbor_stdout(dir, &["scip", "index.scip", "--root", "."]);
+
+    let stdout = run_arbor_stdout(dir, &["inspect", "Checkout.gateway", ".", "--json"]);
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+
+    let relationships = &value["relationships"];
+    assert!(
+        relationships.is_object(),
+        "expected a relationships object, got: {value}"
+    );
+
+    let outgoing_uses_type = &relationships["outgoing"]["uses_type"];
+    assert_eq!(
+        outgoing_uses_type["count"], 1,
+        "the field's declared type must show up as an outgoing uses_type edge: {value}"
+    );
+    assert!(
+        outgoing_uses_type["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["qualifiedName"].as_str().unwrap().contains("Gateway")),
+        "got: {value}"
+    );
+
+    let incoming_references = &relationships["incoming"]["references"];
+    assert_eq!(
+        incoming_references["count"], 1,
+        "pay()'s access to the field must show up as an incoming references edge: {value}"
+    );
+}
+
+/// `uses-type Gateway` has two matches in this fixture — `Checkout.gateway`
+/// and the test fixture's `CheckoutTest.gateway` — so `--limit 1` must both
+/// cut the list and say so in numbers that agree with what is printed.
+#[test]
+fn uses_type_limit_truncates_and_says_so() {
+    let temp = setup_java_project_with_relationships();
+    let dir = temp.path();
+
+    run_arbor_stdout(dir, &["scip", "index.scip", "--root", "."]);
+
+    let stdout = run_arbor_stdout(dir, &["uses-type", "Gateway", ".", "--limit", "1"]);
+    assert!(
+        stdout.contains("2 total, showing 1"),
+        "header must name both numbers, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("Showing 1 of 2"),
+        "footer must name both numbers, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("--limit 0"),
+        "footer must name the escape hatch, got: {stdout}"
+    );
+}
+
+/// The JSON form must carry `total` so a consumer can never mistake a
+/// truncated list for the whole answer.
+#[test]
+fn uses_type_json_carries_total_when_truncated() {
+    let temp = setup_java_project_with_relationships();
+    let dir = temp.path();
+
+    run_arbor_stdout(dir, &["scip", "index.scip", "--root", "."]);
+
+    let stdout = run_arbor_stdout(
+        dir,
+        &["uses-type", "Gateway", ".", "--json", "--limit", "1"],
+    );
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+
+    assert_eq!(value["total"], 2, "got: {value}");
+    assert_eq!(
+        value["usesType"].as_array().unwrap().len(),
+        1,
+        "the list itself must stay truncated: {value}"
+    );
+}
+
+/// `--exclude-test` must drop the match that lives under `src/test/...`.
+#[test]
+fn uses_type_exclude_test_drops_test_file_result() {
+    let temp = setup_java_project_with_relationships();
+    let dir = temp.path();
+
+    run_arbor_stdout(dir, &["scip", "index.scip", "--root", "."]);
+
+    let stdout = run_arbor_stdout(dir, &["uses-type", "Gateway", ".", "--exclude-test"]);
+    assert!(
+        stdout.contains("Checkout.gateway"),
+        "the non-test match must survive: {stdout}"
+    );
+    assert!(
+        !stdout.contains("CheckoutTest"),
+        "the test-file match must be filtered out: {stdout}"
+    );
 }
