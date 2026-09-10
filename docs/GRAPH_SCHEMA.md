@@ -137,13 +137,12 @@ Maps node kinds to IDs. Used for filtering by type.
 
 ## Serialization
 
-The graph can be serialized to JSON for export or persistence:
+`arbor export` writes this shape:
 
 ```json
 {
   "version": "1.0",
-  "projectRoot": "/path/to/project",
-  "timestamp": "2024-01-15T10:30:00Z",
+  "provenance": "scip",
   "stats": {
     "nodeCount": 1542,
     "edgeCount": 4820
@@ -152,10 +151,25 @@ The graph can be serialized to JSON for export or persistence:
     { "id": "...", "name": "...", ... }
   ],
   "edges": [
-    { "from": "...", "to": "...", "kind": "..." }
+    {
+      "source": "...",
+      "target": "...",
+      "kind": "calls",
+      "confidence": 1.0,
+      "file": "src/checkout.rs",
+      "line": 42
+    }
   ]
 }
 ```
+
+`provenance` is `"scip"` when the graph was built by `arbor scip` (compiler-resolved
+edges) and `"tree-sitter"` otherwise (name-guessed edges). `edges[].source`/`target`
+are node IDs, matching the `id` field on entries in `nodes`. `confidence` is
+`1.0` for an exact match and lower for a name-only guess; a consumer that
+needs certainty should filter on it rather than treating every edge as
+proven. `file`/`line` are `null` when the edge carries no location (for
+example, a synthesised virtual-dispatch edge).
 
 ## Language-Specific Mappings
 

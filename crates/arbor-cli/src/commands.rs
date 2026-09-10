@@ -1488,9 +1488,11 @@ pub fn index(
         }
     }
 
-    // Export if requested
+    // Export if requested. This graph was just parsed by Tree-sitter, so its
+    // provenance is fixed regardless of what `.arbor/scip.json` still says at
+    // this point (it is cleared below, but only after this export).
     if let Some(out_path) = output {
-        export_graph(&result.graph, out_path)?;
+        export_graph(&result.graph, out_path, "tree-sitter")?;
     }
 
     save_graph_snapshot(&resolved_path, &result.graph)?;
@@ -2173,7 +2175,8 @@ fn index_changed_only(path: &Path, output: Option<&Path>, follow_symlinks: bool)
     clear_scip_provenance(path);
 
     if let Some(out_path) = output {
-        export_graph(&graph, out_path)?;
+        // Also unambiguously Tree-sitter, same reasoning as `index`'s export.
+        export_graph(&graph, out_path, "tree-sitter")?;
     }
 
     println!(
@@ -2192,16 +2195,19 @@ fn index_changed_only(path: &Path, output: Option<&Path>, follow_symlinks: bool)
     Ok(())
 }
 
-fn export_graph(graph: &arbor_graph::ArborGraph, path: &Path) -> Result<()> {
+fn export_graph(graph: &arbor_graph::ArborGraph, path: &Path, provenance: &str) -> Result<()> {
     let nodes: Vec<_> = graph.nodes().collect();
+    let edges = graph.export_edges_detailed();
 
     let export = serde_json::json!({
         "version": "1.0",
+        "provenance": provenance,
         "stats": {
             "nodeCount": graph.node_count(),
             "edgeCount": graph.edge_count()
         },
-        "nodes": nodes
+        "nodes": nodes,
+        "edges": edges
     });
 
     fs::write(path, serde_json::to_string_pretty(&export)?)?;
@@ -2614,7 +2620,8 @@ pub fn export(path: &Path, output: &Path) -> Result<()> {
     // Reads the cached graph, so exporting a SCIP project yields its exact
     // edges rather than a freshly-guessed Tree-sitter set.
     let graph = load_or_index_graph(&resolved_path)?;
-    export_graph(&graph, output)?;
+    let provenance = provenance_str(&resolved_path);
+    export_graph(&graph, output, provenance)?;
     Ok(())
 }
 

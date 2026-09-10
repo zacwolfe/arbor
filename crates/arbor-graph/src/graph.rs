@@ -3,7 +3,7 @@
 //! The ArborGraph wraps petgraph and adds indexes for fast lookups.
 //! It's the central data structure that everything else works with.
 
-use crate::edge::{Edge, EdgeKind, GraphEdge, PinnedEdge};
+use crate::edge::{Edge, EdgeKind, ExportEdge, GraphEdge, PinnedEdge};
 use crate::search_index::SearchIndex;
 use arbor_core::CodeNode;
 use petgraph::stable_graph::{NodeIndex, StableDiGraph};
@@ -662,6 +662,29 @@ impl ArborGraph {
             .collect()
     }
 
+    /// Like [`Self::export_edges`], but carries confidence/file/line through
+    /// for `arbor export` — the bulk dump, where dropping that detail is what
+    /// forced people to decode `graph.json`'s petgraph serialisation by hand
+    /// instead.
+    pub fn export_edges_detailed(&self) -> Vec<ExportEdge> {
+        (&self.graph)
+            .edge_references()
+            .filter_map(|edge_ref| {
+                let source = self.graph.node_weight(edge_ref.source())?.id.clone();
+                let target = self.graph.node_weight(edge_ref.target())?.id.clone();
+                let weight = edge_ref.weight(); // &Edge
+                Some(ExportEdge {
+                    source,
+                    target,
+                    kind: weight.kind,
+                    confidence: weight.confidence,
+                    file: weight.file.clone(),
+                    line: weight.line,
+                })
+            })
+            .collect()
+    }
+
     /// Iterates over all node indexes.
     pub fn node_indexes(&self) -> impl Iterator<Item = NodeId> + '_ {
         self.graph.node_indices()
@@ -863,6 +886,46 @@ mod tests {
         // No callers/callees for disconnected nodes
         assert!(g.get_callers(a).is_empty());
         assert!(g.get_callees(b).is_empty());
+    }
+
+    #[test]
+    fn test_export_edges_detailed_round_trips_confidence() {
+        let mut g = ArborGraph::new();
+        let a = g.add_node(make_node("caller", "a.rs"));
+        let b = g.add_node(make_node("callee", "b.rs"));
+        let c = g.add_node(make_node("base", "c.rs"));
+
+        let id_a = g.get(a).unwrap().id.clone();
+        let id_b = g.get(b).unwrap().id.clone();
+        let id_c = g.get(c).unwrap().id.clone();
+
+        g.add_edge(
+            a,
+            b,
+            Edge::with_location(EdgeKind::Calls, "a.rs", 7).with_confidence(0.4),
+        );
+        g.add_edge(b, c, Edge::new(EdgeKind::Implements));
+
+        let exported = g.export_edges_detailed();
+        assert_eq!(exported.len(), 2);
+
+        let calls_edge = exported
+            .iter()
+            .find(|e| e.kind == EdgeKind::Calls)
+            .expect("calls edge present");
+        assert_eq!(calls_edge.source, id_a);
+        assert_eq!(calls_edge.target, id_b);
+        assert_eq!(calls_edge.confidence, 0.4);
+        assert_eq!(calls_edge.file, Some("a.rs".to_string()));
+        assert_eq!(calls_edge.line, Some(7));
+
+        let implements_edge = exported
+            .iter()
+            .find(|e| e.kind == EdgeKind::Implements)
+            .expect("implements edge present");
+        assert_eq!(implements_edge.source, id_b);
+        assert_eq!(implements_edge.target, id_c);
+        assert_eq!(implements_edge.confidence, 1.0);
     }
 
     #[test]

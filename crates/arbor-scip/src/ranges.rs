@@ -4,14 +4,30 @@
 //! An edge needs an owner: `UserService.validate` calls `Repo.findOne`, not
 //! "UserService.java calls Repo.findOne". This module recovers that owner.
 //!
-//! # Two range encodings
+//! # Two range encodings, both live
 //!
-//! SCIP has carried positions two ways. The original `repeated int32 range`
-//! traded type safety for payload size; it is now deprecated in favour of the
-//! typed `single_line_range` / `multi_line_range` oneof, and current
-//! `scip-java` emits *only* the typed form. Reading just one encoding silently
-//! yields a graph with zero nodes, so [`occurrence_span`] tries typed first
-//! and falls back to the legacy array for older producers.
+//! SCIP carries positions two ways. The original `repeated int32 range` traded
+//! type safety for payload size and the schema marks it deprecated in favour of
+//! the typed `single_line_range` / `multi_line_range` oneof. **"Deprecated" here
+//! describes the schema, not the field's use in practice, and neither encoding
+//! is safe to drop.** Measured occurrence counts per producer:
+//!
+//! | producer | typed | array |
+//! |---|---|---|
+//! | `scip-java` | all | none |
+//! | `rust-analyzer` | none | 69,618 |
+//! | `scip-typescript` | none | 1,385 |
+//! | `scip-python` | none | 1,209 |
+//!
+//! So `scip-java` is the lone typed-only producer, and the "deprecated" array is
+//! the *only* encoding every non-JVM indexer measured emits. Reading just one
+//! encoding does not degrade — it yields a graph with **zero nodes**, because
+//! every definition is skipped for having no readable position. [`decode_span`]
+//! is therefore load-bearing for Rust, TypeScript and Python, and pruning it as
+//! dead code breaks those three outright.
+//!
+//! [`occurrence_span`] tries typed first, as the schema requires, and falls back
+//! to the array.
 
 use scip::types::{occurrence, MultiLineRange, Occurrence, SingleLineRange};
 
@@ -34,14 +50,18 @@ impl Span {
     }
 }
 
-/// Decodes the deprecated SCIP range array into a 1-indexed [`Span`].
+/// Decodes the schema-deprecated SCIP range array into a 1-indexed [`Span`].
 ///
-/// The legacy encoding packs a range as either `[startLine, startChar,
-/// endChar]` when it sits on one line, or `[startLine, startChar, endLine,
-/// endChar]` when it does not. Lines are 0-indexed there and 1-indexed here.
+/// The array packs a range as either `[startLine, startChar, endChar]` when it
+/// sits on one line, or `[startLine, startChar, endLine, endChar]` when it does
+/// not. Lines are 0-indexed there and 1-indexed here.
 ///
-/// Kept for indexes produced before the typed encoding existed; prefer
-/// [`occurrence_span`], which handles both.
+/// **Not a compatibility shim for old indexes.** `rust-analyzer`,
+/// `scip-typescript` and `scip-python` emit this encoding and nothing else
+/// today, so this function is the only reason a Rust, TypeScript or Python index
+/// produces any nodes at all — see the module docs for the counts. Prefer
+/// [`occurrence_span`], which handles both encodings in the order the schema
+/// requires.
 pub fn decode_span(range: &[i32]) -> Option<Span> {
     let (start, end) = match range {
         [start_line, _start_char, _end_char] => (*start_line, *start_line),
@@ -75,13 +95,16 @@ fn span_from_multi_line(range: &MultiLineRange) -> Option<Span> {
 /// The span of an occurrence itself.
 ///
 /// Prefers the typed encoding, as the schema requires: `typed_range` takes
-/// precedence over the deprecated `range` array.
+/// precedence over the `range` array. The fallback is not a legacy path — it is
+/// what every non-JVM indexer measured actually uses, so both arms carry real
+/// traffic.
 pub fn occurrence_span(occurrence: &Occurrence) -> Option<Span> {
     match &occurrence.typed_range {
         Some(occurrence::Typed_range::SingleLineRange(range)) => span_from_single_line(range),
         Some(occurrence::Typed_range::MultiLineRange(range)) => span_from_multi_line(range),
-        // The oneof is `#[non_exhaustive]`: a future encoding we do not know
-        // should fall back to the legacy array rather than drop the node.
+        // Also the path every non-JVM indexer takes, not just an unknown-oneof
+        // guard: the array is what rust-analyzer, scip-typescript and
+        // scip-python emit. Dropping the node here would empty their graphs.
         _ => decode_span(&occurrence.range),
     }
 }
@@ -256,9 +279,10 @@ mod tests {
         range
     }
 
-    /// Current `scip-java` emits ONLY the typed encoding. Reading just the
-    /// deprecated array yields a graph with zero nodes, so this is the case
-    /// that must not regress.
+    /// `scip-java` emits ONLY the typed encoding. Reading just the array form
+    /// yields a graph with zero nodes on every JVM project, so this is the case
+    /// that must not regress — and its mirror image below covers the three
+    /// indexers that emit only the array.
     #[test]
     fn reads_typed_single_line_range() {
         let mut occurrence = Occurrence::new();
@@ -306,8 +330,13 @@ mod tests {
         );
     }
 
+    /// The array encoding is what `rust-analyzer` (69,618 occurrences),
+    /// `scip-typescript` (1,385) and `scip-python` (1,209) emit — and they emit
+    /// nothing else. This is not a compatibility test for old indexes; it is the
+    /// only path those three languages take, and without it their graphs are
+    /// empty.
     #[test]
-    fn falls_back_to_the_legacy_array_when_no_typed_range() {
+    fn reads_the_array_encoding_every_non_jvm_indexer_emits() {
         let mut occurrence = Occurrence::new();
         occurrence.range = vec![9, 4, 19, 5];
         occurrence.enclosing_range = vec![9, 4, 29, 1];
@@ -317,9 +346,9 @@ mod tests {
     }
 
     #[test]
-    fn typed_range_wins_over_the_legacy_array() {
-        // The schema says the typed encoding takes precedence. A producer that
-        // writes both must not have the deprecated value preferred.
+    fn typed_range_wins_when_a_producer_writes_both() {
+        // The schema says the typed encoding takes precedence, so a producer
+        // that writes both must not have the array value preferred.
         let mut occurrence = Occurrence::new();
         occurrence.range = vec![99, 0, 10];
         occurrence.typed_range = Some(occurrence::Typed_range::SingleLineRange(single_line(9)));

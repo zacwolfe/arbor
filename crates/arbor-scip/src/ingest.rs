@@ -606,8 +606,10 @@ mod tests {
         occurrence
     }
 
-    /// The deprecated `repeated int32` encoding, for indexes predating the
-    /// typed oneof. Ingest must still read them.
+    /// The `repeated int32` encoding — schema-deprecated, but what
+    /// `rust-analyzer`, `scip-typescript` and `scip-python` emit *exclusively*.
+    /// "Legacy" names the schema's opinion, not the traffic: these fixtures
+    /// stand in for every non-JVM language Arbor supports.
     fn legacy_definition(symbol: &str, start_line: i32, end_line: i32) -> Occurrence {
         let mut occurrence = Occurrence::new();
         occurrence.symbol = symbol.to_string();

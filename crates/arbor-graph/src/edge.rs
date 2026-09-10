@@ -153,3 +153,34 @@ pub struct GraphEdge {
     pub target: String,
     pub kind: EdgeKind,
 }
+
+/// A full edge for `arbor export`, source/target already resolved to
+/// [`arbor_core::CodeNode::id`] strings.
+///
+/// Kept separate from [`GraphEdge`] — which the WebSocket protocol already
+/// depends on with exactly three fields — rather than adding fields to it.
+/// The field that matters most here is `confidence`: an export that drops it
+/// lets a consumer treat a name-guessed Tree-sitter edge as a compiler-proven
+/// fact, which is the same class of mistake as reporting an empty result as
+/// an absence (see `get_implementors`). Field names match `GraphEdge`'s
+/// (`source`/`target`) so the two shapes never disagree about what to call
+/// the same thing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExportEdge {
+    /// [`arbor_core::CodeNode::id`] of the source node.
+    pub source: String,
+
+    /// [`arbor_core::CodeNode::id`] of the target node.
+    pub target: String,
+
+    pub kind: EdgeKind,
+
+    /// How sure we are this edge is real, in `[0.0, 1.0]`. See [`Edge::confidence`].
+    pub confidence: f32,
+
+    /// File where this edge originates, if known.
+    pub file: Option<String>,
+
+    /// Line number where this edge originates, if known.
+    pub line: Option<u32>,
+}

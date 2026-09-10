@@ -492,11 +492,17 @@ remainder is indistinguishable from a decoding bug.
   not represented.
 - **Visibility is unknown.** SCIP carries no portable notion of access
   modifiers, so every SCIP node has the default visibility rather than a guess.
-- **Two range encodings exist.** SCIP's original `repeated int32 range` is
-  deprecated in favour of a typed `single_line_range` / `multi_line_range`
-  oneof, and current `scip-java` emits only the typed form. Arbor reads both,
-  typed first. If a future producer invents a third, definitions will be
-  skipped with an `unreadable range` warning rather than silently mislocated.
+- **Two range encodings exist, and both are load-bearing.** SCIP's original
+  `repeated int32 range` is marked deprecated in the schema in favour of a typed
+  `single_line_range` / `multi_line_range` oneof. That word describes the schema,
+  not practice: `scip-java` is the only producer measured that emits the typed
+  form, and the "deprecated" array is the *only* encoding `rust-analyzer`
+  (69,618 occurrences), `scip-typescript` (1,385) and `scip-python` (1,209)
+  emit. Arbor reads both, typed first. Neither branch is removable — dropping
+  the array support does not degrade those three languages, it empties their
+  graphs, since a definition with no readable position is skipped entirely. If a
+  future producer invents a third encoding, definitions are skipped with an
+  `unreadable range` warning rather than silently mislocated.
 
 ## Other JVM tooling considered
 

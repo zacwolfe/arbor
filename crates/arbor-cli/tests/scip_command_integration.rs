@@ -569,6 +569,84 @@ fn export_emits_the_scip_graph() {
     let value: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
     // 4 SCIP definitions, not the Tree-sitter node count for the same tree.
     assert_eq!(value["stats"]["nodeCount"], 4);
+    assert_eq!(value["provenance"], "scip");
+
+    let edges = value["edges"].as_array().expect("edges array");
+    let edge_count = value["stats"]["edgeCount"].as_u64().unwrap() as usize;
+    assert!(!edges.is_empty(), "SCIP export dropped every edge");
+    assert_eq!(
+        edges.len(),
+        edge_count,
+        "edges array length must match stats.edgeCount"
+    );
+
+    // The fixture's dispatch expansion produces `calls` edges (the declared
+    // interface call and the synthesised call into the implementation), plus
+    // the `implements` relationship itself.
+    assert!(
+        edges.iter().any(|e| e["kind"] == "calls"),
+        "expected a calls edge, got: {edges:?}"
+    );
+    assert!(
+        edges.iter().any(|e| e["kind"] == "implements"),
+        "expected an implements edge, got: {edges:?}"
+    );
+
+    for edge in edges {
+        assert!(edge["source"].is_string(), "edge missing source: {edge}");
+        assert!(edge["target"].is_string(), "edge missing target: {edge}");
+        assert!(
+            edge["confidence"].is_number(),
+            "edge missing confidence: {edge}"
+        );
+    }
+}
+
+/// A plain `arbor index` on the same project produces a Tree-sitter graph,
+/// and the export must say so.
+#[test]
+fn export_after_plain_index_reports_tree_sitter_provenance() {
+    let temp = setup_java_project();
+    let dir = temp.path();
+
+    run_arbor_stdout(dir, &["index", "."]);
+    run_arbor_stdout(dir, &["export", "--output", "g.json", "."]);
+
+    let text = fs::read_to_string(dir.join("g.json")).expect("read export");
+    let value: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
+    assert_eq!(value["provenance"], "tree-sitter");
+}
+
+/// A Tree-sitter graph must also carry its edges through export — this repo's
+/// Tree-sitter parsers are calls-only, so a fixture with a plain, undotted
+/// call (no receiver to type) is enough to exercise it.
+#[test]
+fn tree_sitter_export_carries_edges() {
+    let temp = TempDir::new().expect("create temp dir");
+    let dir = temp.path();
+    fs::write(dir.join("pom.xml"), "<project/>\n").expect("write pom.xml");
+
+    let sources = dir.join("src/main/java/com/example");
+    fs::create_dir_all(&sources).expect("create source dirs");
+    fs::write(
+        sources.join("Foo.java"),
+        "package com.example;\n\npublic class Foo {\n    public void bar() {\n        baz();\n    }\n    public void baz() {}\n}\n",
+    )
+    .expect("write Foo.java");
+
+    run_arbor_stdout(dir, &["index", "."]);
+    run_arbor_stdout(dir, &["export", "--output", "g.json", "."]);
+
+    let text = fs::read_to_string(dir.join("g.json")).expect("read export");
+    let value: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
+    assert_eq!(value["provenance"], "tree-sitter");
+
+    let edges = value["edges"].as_array().expect("edges array");
+    assert!(
+        !edges.is_empty(),
+        "expected the direct bar->baz call to survive export, got: {value}"
+    );
+    assert!(edges.iter().all(|e| e["kind"] == "calls"));
 }
 
 /// Puts a fake `scip-java` on PATH so the pipeline can be exercised without a

@@ -53,7 +53,7 @@ pub use diff::{
     changed_node_ids, changed_node_ids_for_ranges, compute_blast_radius, node_matches_changed_file,
     parse_unified_diff_ranges, BlastRadiusSummary, ChangedRange, ChangedSymbols,
 };
-pub use edge::{Edge, EdgeKind, GraphEdge, PinnedEdge};
+pub use edge::{Edge, EdgeKind, ExportEdge, GraphEdge, PinnedEdge};
 pub use graph::{ArborGraph, NodeId};
 pub use heuristics::{
     detect_analysis_limitations, AnalysisWarning, HeuristicsMatcher, UncertainEdge,
