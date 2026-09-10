@@ -185,11 +185,15 @@ All query commands support `--json`. `map` additionally supports `--tokens N`, `
 To integrate arbor into a target project for AI agent use.
 
 **Steps 2–4 are automated:** `arbor hook claude` (add `--global` for the user
-config) writes the hooks, the permission allow-list, and the CLAUDE.md guidance
-block. It merges rather than overwrites — existing hooks, permissions, `deny`
-entries, `env`, and CLAUDE.md content are preserved — and re-running updates the
-arbor block in place. It prefers an existing `.claude/CLAUDE.md` if there is one,
-otherwise creates `./CLAUDE.md`.
+config) writes the hooks, the permission allow-list, an `env` entry, and the
+CLAUDE.md guidance block. It merges rather than overwrites — existing hooks,
+permissions, `deny` entries, other `env` keys, and CLAUDE.md content are
+preserved — and re-running updates the arbor block in place. It prefers an
+existing `.claude/CLAUDE.md` if there is one, otherwise creates `./CLAUDE.md`.
+If that file already carries hand-written arbor guidance from before this
+command existed (unmarked, no markers to update in place), it is adopted into
+the marker-delimited block rather than duplicated — the original is backed up
+to `CLAUDE.md.arbor-backup` first.
 
 Step 1 is **not** automated: `.mcp.json` must still be written by hand, because
 the MCP server entry needs an absolute path to both the `arbor` binary and the
@@ -251,7 +255,9 @@ reviewable.
 - **PreToolUse #2**: Blocks recursive grep/ripgrep and tells the agent to use arbor instead.
 - **PostToolUse**: Injects `arbor map` output (project skeleton) on the first Bash call each day. Flag file is per-project (`.arbor/.map-injected-<date>`), so each project triggers independently. Runs with `ARBOR_NO_AUTO_REBUILD=1` — on a SCIP project a stale index would otherwise make this hook block on a full compile, with `2>/dev/null` hiding why.
 
-`arbor hook claude` also allow-lists `arbor scip --task-status` (read-only) but deliberately **not** `arbor scip *`, since that would let an agent start a multi-minute Gradle build unprompted, and its injected guidance tells the agent never to run `arbor index` on a SCIP project.
+`arbor hook claude` also writes `"env": {"ARBOR_NO_AUTO_REBUILD": "1"}` at the top level of `.claude/settings.json` (merged into any existing `env`, and left untouched if the key is already set to something else). The inline `ARBOR_NO_AUTO_REBUILD=1` on the map hook above still works on its own, but every other allow-listed arbor command — `callers`, `callees`, `map`, etc. — is invoked bare, so without this the agent's first read on a stale SCIP project blocks on a rebuild instead of getting the cached graph plus a warning.
+
+`arbor hook claude` also allow-lists `arbor scip --task-status` (read-only) but deliberately **not** `arbor scip *`, since starting a rebuild costs anywhere from under a second to a multi-minute Gradle/Maven build depending on the project's language — the agent can't tell which from inside a query, and its injected guidance tells the agent never to run `arbor index` on a SCIP project.
 
 ### 3. Permissions (`.claude/settings.json`)
 
@@ -267,7 +273,8 @@ members get both from one checked-in config.
 ```
 
 Do **not** use a blanket `Bash(arbor *)`. That allow-lists `arbor scip --background`,
-which starts a multi-minute Gradle build, and `arbor index --force`, which
+whose cost ranges from under a second (`scip-php`) to a multi-minute Gradle/Maven
+build (`scip-java`) depending on the project, and `arbor index --force`, which
 replaces a compiler-resolved graph with guessed edges. The installed list is
 read-only commands plus `arbor scip --task-status`.
 

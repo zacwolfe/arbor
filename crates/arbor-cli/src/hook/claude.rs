@@ -13,6 +13,12 @@ const BEGIN_MARKER: &str =
     "<!-- BEGIN arbor-claude-guidance (auto-installed by `arbor hook claude`; remove this block to disable) -->";
 const END_MARKER: &str = "<!-- END arbor-claude-guidance -->";
 
+/// First line of [`GUIDANCE`], unchanged since the first version of this
+/// file. Its presence *without* the markers means someone pasted the
+/// guidance into their own CLAUDE.md by hand before `arbor hook claude`
+/// existed — nothing else plausibly starts a heading with this text.
+const LEGACY_FINGERPRINT: &str = "## Code Navigation (MANDATORY)";
+
 /// arbor commands allow-listed so the agent runs them without a prompt.
 const PERMISSIONS: &[&str] = &[
     "Bash(arbor query *)",
@@ -35,8 +41,9 @@ const PERMISSIONS: &[&str] = &[
     "Bash(arbor refactor *)",
     "Bash(arbor export *)",
     "Bash(arbor status *)",
-    // Polling a rebuild is read-only. Deliberately NOT `arbor scip *`: that
-    // would let an agent kick off a multi-minute Gradle build unprompted.
+    // Polling a rebuild is read-only. Deliberately NOT `arbor scip *`: an
+    // agent can't tell from here which indexer a project needs, and on a JVM
+    // project that's a multi-minute Gradle/Maven build kicked off unprompted.
     "Bash(arbor scip --task-status *)",
     "Bash(arbor scip --task-status)",
 ];
@@ -94,6 +101,24 @@ fn apply_directives(root: &Path, scope: &Scope) -> Result<()> {
     }
 
     let existing = fs::read_to_string(&path).unwrap_or_default();
+
+    // An unmarked legacy block (pasted in by hand before this command
+    // existed) is the one case where rewriting the file removes text arbor
+    // never wrote. Back it up first so adoption is reversible without git.
+    if !existing.contains(BEGIN_MARKER) && find_legacy_region(&existing).is_some() {
+        let backup = backup_path(&path);
+        fs::write(&backup, &existing)?;
+        println!(
+            "  {} found an unmarked arbor block (pasted in before `arbor hook claude` existed); adopting it — future runs will update it in place",
+            "•".dimmed()
+        );
+        println!(
+            "  {} backed up original CLAUDE.md to {}",
+            "✓".green(),
+            backup.display()
+        );
+    }
+
     let updated = upsert_block(&existing, &directives_block());
 
     if updated == existing {
@@ -111,8 +136,33 @@ fn apply_directives(root: &Path, scope: &Scope) -> Result<()> {
     Ok(())
 }
 
-/// Replace the existing marker-delimited Arbor block, or append a fresh one. A
-/// brand-new file gets a `# CLAUDE.md` header before the block.
+/// Path for the pre-adoption backup, next to the original file.
+fn backup_path(path: &Path) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(".arbor-backup");
+    path.with_file_name(name)
+}
+
+/// Find the byte range of an unmarked legacy Arbor block: from
+/// [`LEGACY_FINGERPRINT`] to the next line that starts a level-2 heading
+/// (`## `), or end of file if there is none. `None` if the fingerprint isn't
+/// present at all.
+fn find_legacy_region(existing: &str) -> Option<(usize, usize)> {
+    let start = existing.find(LEGACY_FINGERPRINT)?;
+    let after = start + LEGACY_FINGERPRINT.len();
+    let end = existing[after..]
+        .find("\n## ")
+        .map(|rel| after + rel + 1) // +1 skips the newline, lands on "## "
+        .unwrap_or(existing.len());
+    Some((start, end))
+}
+
+/// Replace the existing marker-delimited Arbor block, adopt an unmarked
+/// legacy block into one, or append a fresh one. A brand-new file gets a
+/// `# CLAUDE.md` header before the block.
 fn upsert_block(existing: &str, block: &str) -> String {
     if let (Some(start), Some(end)) = (existing.find(BEGIN_MARKER), existing.find(END_MARKER)) {
         let end = end + END_MARKER.len();
@@ -120,6 +170,20 @@ fn upsert_block(existing: &str, block: &str) -> String {
         out.push_str(&existing[..start]);
         out.push_str(block);
         out.push_str(&existing[end..]);
+        return out;
+    }
+
+    if let Some((start, end)) = find_legacy_region(existing) {
+        let mut out = String::with_capacity(existing.len());
+        out.push_str(&existing[..start]);
+        out.push_str(block);
+        let rest = &existing[end..];
+        if rest.is_empty() {
+            out.push('\n');
+        } else {
+            out.push_str("\n\n");
+            out.push_str(rest);
+        }
         return out;
     }
 
@@ -188,7 +252,7 @@ arbor map . --exclude-test --focus-changed    # boost symbols in files you're ed
 ### Finding symbols
 - `arbor query "name" . --exclude-test` — fuzzy search for symbols (production code only)
 - `arbor query "term1|term2|term3" . --exclude-test` — multi-term OR search (replaces grep with alternation)
-- `arbor inspect "symbol" .` — full detail on one symbol (file, lines, role, centrality, caller/callee counts)
+- `arbor inspect "symbol" .` — full detail on one symbol (file, lines, role, centrality, caller/callee counts, and relationships grouped by kind in both directions)
 
 ### Understanding relationships
 - `arbor callers "symbol" .` — who calls this? (one hop upstream)
@@ -229,13 +293,15 @@ When `arbor query` returns test files but you need production code, do NOT fall 
 
 `arbor status .` prints `Source: SCIP index (...)` when it does. On such a project the graph comes from the compiler, not from Tree-sitter, so `obj.method()` calls and interface implementations are real edges rather than absent ones.
 
-Three rules follow:
+Five rules follow:
 
 1. **Never run `arbor index`.** It is refused on these projects, because Tree-sitter cannot resolve method calls and would replace exact edges with guesses. The refusal mentions `--force`; do NOT use it.
-2. **Refreshing requires a compile, so it is the human's call.** If a query looks stale, say so and suggest they run `arbor scip --background`. Do not run it yourself — it starts a multi-minute Gradle build.
-3. **A rebuild in flight is pollable**: `arbor scip --task-status` is read-only and safe to run.
+2. **Treat `implementors`, `supertypes`, `uses-type`, and `references` as needing this graph to answer at all.** On a Tree-sitter graph they say the question is unanswerable rather than returning an empty list. An empty result from any of them is never evidence there are none — an interface read back with zero implementors after four real ones is how someone deletes it.
+3. **Refreshing requires a compile, and the cost is language-dependent — assume it may be expensive.** For some indexers it's seconds; for a JVM project (`scip-java`) it's a full Gradle/Maven build that can run minutes. You cannot tell which applies from inside a query, so refreshing stays the human's call by default: if a query looks stale, say so and suggest they run `arbor scip --background`. Do not run it yourself.
+4. **A rebuild in flight is pollable**: `arbor scip --task-status` is read-only and safe to run.
+5. **A result may come from a cached graph, and that's expected.** `ARBOR_NO_AUTO_REBUILD=1` is set for you, so a stale index answers from cache instead of blocking on a compile; you may see a warning naming the indexer that would refresh it. That warning is not an error — do not try to work around it (unsetting the variable, shelling out to the indexer yourself). Tell the human the graph is stale and that `arbor scip --background` will refresh it.
 
-If a read command prints `Sources changed ... rebuilding now`, it is compiling before answering. Let it finish rather than interrupting.
+Rule 5 is why you should not normally see this, but if `ARBOR_NO_AUTO_REBUILD` is not in effect and a read command prints `Sources changed ... rebuilding now`, it is compiling before it answers. Let it finish rather than interrupting.
 
 "#;
 
@@ -265,8 +331,9 @@ fn apply_settings(root: &Path) -> Result<()> {
 
     let hooks_changed = ensure_hooks(&mut settings);
     let perms_changed = ensure_permissions(&mut settings);
+    let env_changed = ensure_env(&mut settings);
 
-    if !hooks_changed && !perms_changed {
+    if !hooks_changed && !perms_changed && !env_changed {
         println!("  {} settings.json already up to date", "•".dimmed());
         return Ok(());
     }
@@ -421,6 +488,48 @@ fn ensure_permissions(settings: &mut Value) -> bool {
     changed
 }
 
+/// Merge `ARBOR_NO_AUTO_REBUILD=1` into `env`, preserving every key already
+/// there.
+///
+/// This is what keeps a plain `arbor callers` from hanging on a stale SCIP
+/// project: without it, a query blocks on a synchronous rebuild before
+/// answering — right for a human, but the agent can't prefix its own calls
+/// with the env var, since `ARBOR_NO_AUTO_REBUILD=1 arbor callers ...` no
+/// longer matches the `Bash(arbor callers *)` allow-list and turns an
+/// allowed command into a permission prompt. Setting it here means the agent
+/// gets the cached graph plus a warning naming the fix, and the human
+/// decides when to spend the compile — without it, one stale JVM project
+/// turns every `arbor callers` into a multi-minute hang.
+///
+/// An existing, differently-set value is left alone and reported on
+/// stdout: the user set it deliberately.
+fn ensure_env(settings: &mut Value) -> bool {
+    let env = settings
+        .as_object_mut()
+        .unwrap()
+        .entry("env")
+        .or_insert_with(|| json!({}));
+    if !env.is_object() {
+        *env = json!({});
+    }
+    let env = env.as_object_mut().unwrap();
+
+    match env.get("ARBOR_NO_AUTO_REBUILD") {
+        None => {
+            env.insert("ARBOR_NO_AUTO_REBUILD".to_string(), json!("1"));
+            true
+        }
+        Some(v) if v.as_str() == Some("1") => false,
+        Some(v) => {
+            println!(
+                "  {} ARBOR_NO_AUTO_REBUILD is already set to {v} in settings.json; leaving it alone",
+                "•".dimmed()
+            );
+            false
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -470,7 +579,8 @@ mod tests {
         assert!(PERMISSIONS.iter().any(|p| p.contains("--task-status")));
         assert!(
             !PERMISSIONS.contains(&"Bash(arbor scip *)"),
-            "a blanket scip allow-list would let an agent start Gradle builds unprompted"
+            "a blanket scip allow-list would let an agent kick off a rebuild unprompted, \
+             and the agent can't tell from here whether that's seconds or a multi-minute compile"
         );
         assert!(
             !PERMISSIONS.iter().any(|p| p.contains("arbor index")),
@@ -480,10 +590,11 @@ mod tests {
 
     #[test]
     fn permissions_are_read_only_commands_not_a_blanket_wildcard() {
-        // `Bash(arbor *)` would allow `arbor scip --background` (a multi-minute
-        // Gradle build) and `arbor index --force` (replaces compiler-resolved
-        // edges with guesses). Arbor's own docs recommended the wildcard until
-        // this was caught.
+        // `Bash(arbor *)` would allow `arbor scip --background` (a rebuild
+        // whose cost depends on the project's language and can run minutes)
+        // and `arbor index --force` (replaces compiler-resolved edges with
+        // guesses). Arbor's own docs recommended the wildcard until this was
+        // caught.
         assert!(
             !PERMISSIONS.contains(&"Bash(arbor *)"),
             "a blanket allow-list would permit rebuilds and downgrades"
@@ -526,5 +637,119 @@ mod tests {
         // Re-running `arbor hook claude` must replace, not append.
         let twice = upsert_block(&block, &block);
         assert_eq!(twice.matches(BEGIN_MARKER).count(), 1);
+    }
+
+    #[test]
+    fn scip_section_names_the_relationship_commands_and_the_empty_result_caveat() {
+        let block = directives_block();
+        let scip_section = block
+            .split("### If this project uses a SCIP index")
+            .nth(1)
+            .expect("guidance must have a SCIP section");
+        for cmd in ["implementors", "supertypes", "uses-type", "references"] {
+            assert!(
+                scip_section.contains(cmd),
+                "SCIP section must name `{cmd}`: {scip_section}"
+            );
+        }
+        assert!(
+            scip_section.contains("never evidence there are none"),
+            "SCIP section must say an empty result from those four is not evidence: {scip_section}"
+        );
+    }
+
+    #[test]
+    fn upsert_block_adopts_an_unmarked_legacy_block_but_keeps_the_users_own_section() {
+        let existing = "# CLAUDE.md\n\n\
+            My own preamble.\n\n\
+            ## Code Navigation (MANDATORY)\n\n\
+            OLD TEXT: run arbor index . to build the graph.\n\n\
+            ### Rules\n\n\
+            1. NEVER use rg.\n\n\
+            ## Their Section\n\n\
+            Keep me.\n";
+        let block = directives_block();
+
+        let updated = upsert_block(existing, &block);
+
+        assert_eq!(
+            updated.matches(BEGIN_MARKER).count(),
+            1,
+            "adoption must leave exactly one marked block: {updated}"
+        );
+        assert!(
+            !updated.contains("OLD TEXT"),
+            "the stale legacy guidance must be gone: {updated}"
+        );
+        assert!(updated.contains("My own preamble."));
+        assert!(updated.contains("## Their Section"));
+        assert!(updated.contains("Keep me."));
+    }
+
+    #[test]
+    fn upsert_block_appends_when_neither_marker_nor_legacy_fingerprint_is_present() {
+        let existing = "# CLAUDE.md\n\nSome unrelated user prose.\n";
+        let block = directives_block();
+
+        let updated = upsert_block(existing, &block);
+
+        assert_eq!(updated.matches(BEGIN_MARKER).count(), 1);
+        assert!(updated.contains("Some unrelated user prose."));
+        // Appended, not adopted in place: the user's prose comes first.
+        assert!(
+            updated.find("Some unrelated user prose").unwrap()
+                < updated.find(BEGIN_MARKER).unwrap()
+        );
+    }
+
+    #[test]
+    fn apply_directives_backs_up_an_adopted_legacy_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("CLAUDE.md");
+        let original = "# CLAUDE.md\n\n\
+            ## Code Navigation (MANDATORY)\n\n\
+            OLD TEXT: run arbor index . to build the graph.\n\n\
+            ## Their Section\n\n\
+            Keep me.\n";
+        fs::write(&path, original).unwrap();
+
+        apply_directives(dir.path(), &Scope::Project(dir.path().to_path_buf())).unwrap();
+
+        let backup = dir.path().join("CLAUDE.md.arbor-backup");
+        assert!(backup.exists(), "adoption must leave a backup file");
+        assert_eq!(fs::read_to_string(&backup).unwrap(), original);
+
+        let updated = fs::read_to_string(&path).unwrap();
+        assert_eq!(updated.matches(BEGIN_MARKER).count(), 1);
+        assert!(!updated.contains("OLD TEXT"));
+        assert!(updated.contains("## Their Section"));
+        assert!(updated.contains("Keep me."));
+
+        // Idempotent: running again must not duplicate the block or the backup.
+        apply_directives(dir.path(), &Scope::Project(dir.path().to_path_buf())).unwrap();
+        let twice = fs::read_to_string(&path).unwrap();
+        assert_eq!(twice.matches(BEGIN_MARKER).count(), 1);
+    }
+
+    #[test]
+    fn ensure_env_sets_the_rebuild_opt_out_when_absent() {
+        let mut settings = json!({});
+        assert!(ensure_env(&mut settings));
+        assert_eq!(settings["env"]["ARBOR_NO_AUTO_REBUILD"], json!("1"));
+    }
+
+    #[test]
+    fn ensure_env_merges_alongside_an_existing_unrelated_key() {
+        let mut settings = json!({ "env": { "SOME_OTHER_VAR": "keep-me" } });
+        assert!(ensure_env(&mut settings));
+        assert_eq!(settings["env"]["SOME_OTHER_VAR"], json!("keep-me"));
+        assert_eq!(settings["env"]["ARBOR_NO_AUTO_REBUILD"], json!("1"));
+    }
+
+    #[test]
+    fn ensure_env_leaves_a_deliberately_different_value_untouched() {
+        let mut settings = json!({ "env": { "ARBOR_NO_AUTO_REBUILD": "0" } });
+        assert!(!ensure_env(&mut settings));
+        assert_eq!(settings["env"]["ARBOR_NO_AUTO_REBUILD"], json!("0"));
     }
 }
